@@ -4720,9 +4720,12 @@ for _, e in ipairs(ACK_BUFFS) do
     local key, label = e[1], e[2]
     if BuffsState[key] then
         local def = ACK_DEFAULTS[key] or BuffsState[key].target
-        ackBoxes[key] = secAck:Textbox(label, fmtNum(BuffsState[key].target), function(s) ackStore(key, s) end)
+        local box = secAck:Textbox(label, fmtNum(BuffsState[key].target), function(s) ackStore(key, s) end)
             :Tooltip("default: " .. fmtNum(def))
-        secAck:Button("Pin " .. label, function() ackPin(key, label) end)
+        ackBoxes[key] = box
+        -- Inline pin (forked lib adds :Pin -> a pin button on the box's right edge). Guarded so
+        -- the upstream fallback lib (no :Pin) won't error; it just won't show a pin then.
+        pcall(function() box:Pin(function() ackPin(key, label) end) end)
     end
 end
 secAck:Button("Reset Defaults", function()
