@@ -3305,7 +3305,8 @@ end
 applyNapeFollow = function()
     restoreNapeFollow()
     local swingUntil = 0
-    Pins.NapeFollow = RunService.Heartbeat:Connect(function()
+    local napeIdleAccum = 0
+    Pins.NapeFollow = RunService.Heartbeat:Connect(function(dt)
         local char = LocalPlayer.Character
         if not char then return end
         local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -3324,6 +3325,18 @@ applyNapeFollow = function()
         -- falling edge of the swing → restore shrunken limbs once
         local justEnded = (not touchable) and Pins._wasNapeTouchable
         Pins._wasNapeTouchable = touchable
+
+        -- PERF: per-frame titan scans + Size writes are the UI-lag culprit. They only matter
+        -- while a swing is live (touchable) or on its falling edge (justEnded restores there).
+        -- When idle (just riding around), drop to ~5Hz maintenance so the menu and game stay
+        -- smooth. Swing frames run at full speed below, so hits land exactly as before.
+        if (not touchable) and (not justEnded) then
+            napeIdleAccum = napeIdleAccum + (dt or 0.016)
+            if napeIdleAccum < 0.2 then return end
+            napeIdleAccum = 0
+        else
+            napeIdleAccum = 0
+        end
 
         local world = Workspace:FindFirstChild("World")
         if not world then return end
@@ -4594,13 +4607,14 @@ local window = Lib:CreateWindow({
     badge    = "v3",
     menuKey  = "f3",                     -- F3 toggles the menu (matches the old bind)
     gameInput = "always",               -- never eat movement keys
+    logo     = "https://tr.rbxcdn.com/180DAY-77f7e55b054259f24c86dd76349155b0/150/150/Image/Png/noFilter",
 })
 LibWindow = window
 _G.MatchaCleanup = function() pcall(function() Lib:Destroy() end) end
 
 -- PERF: the ~1s periodic stutter is the library's autosave — every 1.2s it re-serializes
 -- the whole config and writefile()s it (a disk-write freeze). Turn it off; Verfall persists
--- via the Save Config button instead. (We deliberately DON'T enable lite/performance mode
+-- via the named config save in the Settings tab instead. (We deliberately DON'T enable lite/performance mode
 -- — it strips the menu animations, which are what make it feel smooth.)
 pcall(function() Lib:SetAutoSave(false) end)
 
@@ -4620,7 +4634,7 @@ end
 -- ===== Tab: Main =====
 local tabMain = window:Tab("Main", "home")
 
-local secHorse = tabMain:Section("Horse", "Left", "mount tweaks")
+local secHorse = tabMain:Section("Horse", "Left", "Mount Tweaks")
 secHorse:Toggle("Infinite Stamina", Features.HorseBoost, function(v)
     Features.HorseBoost = v
     if v then applyHorseBoost() else restoreHorse() end
@@ -4630,7 +4644,7 @@ secHorse:Slider("Max Speed", Horse.MaxSpeed, 1, 65, 145, "", function(v)
     if Features.HorseBoost then applyHorseBoost() end
 end)
 
-local secVis = tabMain:Section("Visuals", "Right", "player + titan esp")
+local secVis = tabMain:Section("Visuals", "Right", "Player + Titan ESP")
 secVis:Toggle("Player ESP", Features.PlayerESP, function(v) Features.PlayerESP = v end)
     :AddKeybind("f4", "Toggle")
     :AddColorpicker("ESP Color", PLAYER_ESP.Color, function(c)
@@ -4643,7 +4657,7 @@ secVis:Toggle("Titan ESP", Features.TitanESP, function(v) Features.TitanESP = v 
 secVis:Toggle("Nape Marker", Features.TitanNapeMarker, function(v) Features.TitanNapeMarker = v end)
 secVis:Slider("Max Distance", PLAYER_ESP.MaxDistance, 50, 0, 100000, "", function(v) PLAYER_ESP.MaxDistance = v end)
 
-local secEls = tabMain:Section("ESP Elements", "Right", "what to draw")
+local secEls = tabMain:Section("ESP Elements", "Right", "What To Draw")
 secEls:Toggle("Box", PLAYER_ESP.ShowBox, function(v) PLAYER_ESP.ShowBox = v end)
 secEls:Toggle("Name", PLAYER_ESP.ShowName, function(v) PLAYER_ESP.ShowName = v end)
 secEls:Toggle("Distance", PLAYER_ESP.ShowDistance, function(v) PLAYER_ESP.ShowDistance = v end)
@@ -4653,23 +4667,63 @@ secEls:Toggle("Health Bar", PLAYER_ESP.ShowHealthBar, function(v) PLAYER_ESP.Sho
 -- ===== Tab: Character =====
 local tabChar = window:Tab("Character", "user")
 
-local secAck = tabChar:Section("Ackerman", "Left", "type a value -> Enter to pin")
+local secAck = tabChar:Section("Ackerman", "Left", "Type Values, Then Pin")
 local ACK_BUFFS = {
     { "HookRange", "Hook Range" },          { "GasConservation", "Gas Conservation" },
     { "ReloadSpeed", "Reload Speed" },      { "OdmVeloCap", "ODM Velo Cap" },
     { "RunSpeed", "Run Speed" },            { "FirearmRange", "Musket Range" },
     { "OdmHookVeloGain", "Hook Velo Gain" },{ "OdmPassiveVeloGain", "Passive Velo Gain" },
-    { "ActionSpeed", "Action Speed" },      { "BladeDura", "Blade Durability" },
+    { "ActionSpeed", "Action Speed" },
 }
+-- The script's default pin value for each buff (matches the BuffsState init + resetConfig).
+-- Shown as each box's tooltip and restored by the "Reset Defaults" button.
+local ACK_DEFAULTS = {
+    HookRange = 15, GasConservation = 1, ReloadSpeed = 1.5, OdmVeloCap = 10,
+    RunSpeed = 11, FirearmRange = 100, OdmHookVeloGain = 10, OdmPassiveVeloGain = 10,
+    ActionSpeed = 2,
+}
+-- Typing only STORES the value now (no auto-pin). Nothing touches your character until you
+-- press "Pin Buffs". We keep the box objects so Reset can refresh their displayed text.
+local ackBoxes = {}
+local function ackStore(key, s)
+    local n = tonumber(s)
+    if n and n > 0 then
+        local b = BuffsState[key]
+        if b then b.target = math.min(n, b.max or 100000) end
+    end
+end
+local function ackSetBoxText(key, s)
+    local box = ackBoxes[key]; if not box then return end
+    if not pcall(function() box:Set(s) end) then pcall(function() box:SetValue(s) end) end
+end
 for _, e in ipairs(ACK_BUFFS) do
     local key, label = e[1], e[2]
     if BuffsState[key] then
-        secAck:Textbox(label, fmtNum(BuffsState[key].target), function(s) setBuffTarget(key, s) end)
-            :Tooltip("default " .. fmtNum(BuffsState[key].default or 0))
+        local def = ACK_DEFAULTS[key] or BuffsState[key].target
+        ackBoxes[key] = secAck:Textbox(label, fmtNum(BuffsState[key].target), function(s) ackStore(key, s) end)
+            :Tooltip("default: " .. fmtNum(def))
     end
 end
+secAck:Button("Pin Buffs", function()
+    local ok = false
+    for _, e in ipairs(ACK_BUFFS) do
+        if BuffsState[e[1]] and pinAttrOnce(e[1], e[1]) then ok = true end
+    end
+    Lib:Notify("Ackerman", ok and "Pinned all buffs to your character"
+        or "ClientInformation not found — join a round first", 3, ok and "success" or "warning")
+end):Tooltip("apply every value above to your character")
+secAck:Button("Reset Defaults", function()
+    for _, e in ipairs(ACK_BUFFS) do
+        local key, def = e[1], ACK_DEFAULTS[e[1]]
+        if BuffsState[key] and def then
+            BuffsState[key].target = def
+            ackSetBoxText(key, fmtNum(def))
+        end
+    end
+    Lib:Notify("Ackerman", "Reset to defaults - press Pin Buffs to apply", 3, "success")
+end):Tooltip("restore the default numbers (shown on each box)")
 
-local secTitan = tabChar:Section("Titans", "Right", "anti-hitbox + weakpoints")
+local secTitan = tabChar:Section("Titans", "Right", "Anti-Hitbox + Weakpoints")
 secTitan:Toggle("No Grab", Features.NoGrab, function(v) Features.NoGrab = v; refreshAntiTitan() end)
 secTitan:Toggle("No Stomp", Features.NoStomp, function(v) Features.NoStomp = v; refreshAntiTitan() end)
 secTitan:Toggle("No Bite", Features.NoBite, function(v) Features.NoBite = v; refreshAntiTitan() end)
@@ -4702,7 +4756,7 @@ local function applyAccent()
     end
 end
 
-local secTheme = setTab:Section("Theme", "Left", "make it yours")
+local secTheme = setTab:Section("Theme", "Left", "Make It Yours")
 local accentTog = secTheme:Toggle("Custom Accent", false, function(v) accentState.on = v; applyAccent() end)
 accentTog:AddColorpicker("Accent Color", YELLOW_A, function(c)
     accentState.color = c; accentState.on = true
@@ -4711,8 +4765,7 @@ accentTog:AddColorpicker("Accent Color", YELLOW_A, function(c)
 end)
 secTheme:Slider("Menu Opacity", 100, 5, 40, 100, "%", function(v) pcall(function() Lib:SetOpacity(v) end) end)
 
-local secScript = setTab:Section("Script", "Right", "config & exit")
-secScript:Button("Save Config", function() pcall(saveConfig); Lib:Notify("Verfall", "config saved", 2, "success") end)
+local secScript = setTab:Section("Script", "Right", "Config & Exit")
 secScript:Button("Reset Defaults", function() pcall(resetConfig); Lib:Notify("Verfall", "reset — reload script to refresh the menu", 4) end)
 secScript:Button("Unload", function() pcall(UnloadScript) end):SetRisk()
 
