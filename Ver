@@ -175,6 +175,7 @@ local Features = {
     NoAttack       = false,  -- disable titan Detectors (no attack triggers fire)
     BladeDura      = false,  -- brute force pin durability on tools (confirmed working)
     CanRollUnlock  = false,  -- flip CanRoll=true on all locked talent categories
+    NoFallDamage   = false,  -- pin FallDamageImmune=true on our character (no fall damage)
 }
 
 -- Single intensity value for Nape Follow (combines range/size/clamp from the 3 locals).
@@ -189,9 +190,11 @@ local Pins = {
     VeloCap = nil,
     Run     = nil,
     AntiTitan = nil,        -- shared heartbeat for all 3 NoGrab/NoStomp/NoBite toggles
-    AntiTitanLoop = nil,    -- continuous Heartbeat re-applying the disable (beats server re-enable)
+    AntiTitanLoop = nil,    -- (unused since 2026-07-02 apply-once change; kept for back-compat)
     HitboxOriginals = {},   -- [part] = {Size, CanCollide, CanTouch} for restore-on-disable
     NapeFollow = nil,       -- heartbeat for nape-follow exploit (swords)
+    NoAggro = nil,          -- heartbeat pinning our IsInvisible=true (No Attack master switch)
+    NoFallDamage = nil,     -- heartbeat pinning our FallDamageImmune=true
     NapeOriginals = {},     -- [part] = original Size, to restore the nape on toggle-off
     LimbOriginals = {},     -- [part] = original Size, to restore shrunk limbs after a swing
     MusketExtender = nil,   -- heartbeat for ranged nape (musket/crossbow)
@@ -286,6 +289,7 @@ local applyMusketExtender, restoreMusketExtender
 local applyNoAttack, restoreNoAttack
 local applyBladeDura, restoreBladeDura
 local applyCanRollUnlock, restoreCanRollUnlock
+local applyNoFallDamage, restoreNoFallDamage
 local LibWindow    -- INS-ui window handle (set at startup; used by UnloadScript)
 
 
@@ -971,29 +975,35 @@ local function anyTitanFeatureOn()
     return Features.NoGrab or Features.NoStomp or Features.NoBite or Features.NoAttack
 end
 
--- Disable a part (snapshotting its originals once) or restore it. `want` = should be off.
+-- A titan whose nape is destroyed (NapeHealth <= 0) or that's flagged Dead is a corpse left in the
+-- Titans folder. Skip it in every per-titan loop so we don't waste bridge writes on bodies — and so
+-- the hitbox expander / anti-grab don't keep working a dead titan (user request 2026-07-02).
+local function isTitanDead(titan)
+    local nh = tonumber(titan:GetAttribute("NapeHealth"))
+    if nh and nh <= 0 then return true end
+    return titan:GetAttribute("Dead") == true
+end
+
+-- Disable a part (snapshotting its original Size once) or restore it. `want` = should be off.
+-- PERF: write ONLY Size. The game's hit/attack checks are geometric (workspace:GetPartsInPart
+-- reads the part's Size), CanTouch reads nil in Matcha so writing it is a wasted bridge call,
+-- and these parts are already CanCollide=false. One Size write vs the old three → 3x less traffic.
 local function setPart(store, part, want)
     if want then
-        if not store[part] then
-            local ok, snap = pcall(function()
-                return { Size = part.Size, CanCollide = part.CanCollide, CanTouch = part.CanTouch }
-            end)
-            store[part] = ok and snap or { Size = TITAN_TINY, CanCollide = false, CanTouch = false }
+        if store[part] == nil then
+            local ok, sz = pcall(function() return part.Size end)
+            store[part] = (ok and sz) or TITAN_TINY
         end
-        pcall(function() part.CanCollide = false end)
-        pcall(function() part.CanTouch  = false end)
-        pcall(function() part.Size      = TITAN_TINY end)
-    elseif store[part] then
-        local snap = store[part]
-        pcall(function() part.CanCollide = snap.CanCollide end)
-        pcall(function() part.CanTouch  = snap.CanTouch end)
-        pcall(function() part.Size      = snap.Size end)
+        pcall(function() part.Size = TITAN_TINY end)
+    elseif store[part] ~= nil then
+        pcall(function() part.Size = store[part] end)
         store[part] = nil
     end
 end
 
 -- Sync ONE titan's hitbox + detector parts to the current toggle state.
 local function processTitan(titan)
+    if isTitanDead(titan) then return end   -- corpse → no writes
     local hb = titan:FindFirstChild("Hitboxes")
     if hb then
         for _, part in ipairs(hb:GetChildren()) do
@@ -1044,45 +1054,45 @@ end
 
 -- Restore every part we touched (covers titans no longer in the tree too) and clear.
 local function restoreAllTitanParts()
-    for part, snap in pairs(Pins.HitboxOriginals) do
-        pcall(function() part.CanCollide = snap.CanCollide; part.CanTouch = snap.CanTouch; part.Size = snap.Size end)
+    for part, sz in pairs(Pins.HitboxOriginals) do
+        pcall(function() part.Size = sz end)
     end
     Pins.HitboxOriginals = {}
-    for part, snap in pairs(Pins.DetectorOriginals) do
-        pcall(function() part.CanCollide = snap.CanCollide; part.CanTouch = snap.CanTouch; part.Size = snap.Size end)
+    for part, sz in pairs(Pins.DetectorOriginals) do
+        pcall(function() part.Size = sz end)
     end
     Pins.DetectorOriginals = {}
 end
 
--- CONTINUOUS re-apply. The server periodically re-enables titan hitboxes (re-replicates
--- their real size back, especially on titan state changes/attacks). Event-driven apply
--- alone decays — the disable "stops working after a while". This Heartbeat keeps
--- re-disabling every frame so the server can never win the race.
-local function startTitanLoop()
+-- SMOOTH RE-APPLY (perf rebuild 2026-07-02). The old design re-scanned EVERY titan and re-wrote
+-- 3 props on every hitbox part ~20x/sec — N titans × ~5 parts × 3 writes × 20Hz FLOODED the bridge
+-- (each write is a round-trip) and made the menu unmovable. Now: each titan is disabled ONCE on
+-- spawn (hookTitans' ChildAdded, retried over ~2s) and once on toggle (processAllTitans), PLUS a
+-- gentle ~3Hz Size-ONLY re-assert so a server-side re-enable can't stick — roughly 20x less bridge
+-- traffic than the old loop (3Hz vs 20Hz, 1 write vs 3), so the menu stays smooth.
+local function startTitanRefresh()
     if Pins.AntiTitanLoop then return end
     local accum = 0
     Pins.AntiTitanLoop = RunService.Heartbeat:Connect(function(dt)
         if not anyTitanFeatureOn() then return end
-        -- Throttle to ~20Hz. The server re-enables hitboxes over SECONDS, so re-disabling
-        -- 20x/sec wins the race just as well as 60x/sec at a third of the per-frame cost.
         accum = accum + (dt or 0.016)
-        if accum < 0.05 then return end
+        if accum < 0.33 then return end   -- ~3Hz; the server re-enables over SECONDS, so this beats it cheaply
         accum = 0
         pcall(processAllTitans)
     end)
 end
-local function stopTitanLoop()
+local function stopTitanRefresh()
     if Pins.AntiTitanLoop then pcall(function() Pins.AntiTitanLoop:Disconnect() end); Pins.AntiTitanLoop = nil end
 end
 
 -- Single entry point for ALL titan toggles (NoGrab/NoStomp/NoBite/NoAttack).
 local function syncTitans()
     if anyTitanFeatureOn() then
-        hookTitans()        -- apply to new titans on spawn
-        processAllTitans()  -- apply to titans already present; restore any type just turned off
-        startTitanLoop()    -- keep re-applying every frame so server re-enables can't stick
+        hookTitans()          -- each NEW titan gets disabled ONCE on spawn
+        processAllTitans()    -- disable once on titans already present; restore any type just toggled off
+        startTitanRefresh()   -- gentle 3Hz Size-only re-assert (beats server re-enable, no flood)
     else
-        stopTitanLoop()
+        stopTitanRefresh()
         unhookTitans()
         restoreAllTitanParts()  -- everything off → undo it all
     end
@@ -1119,8 +1129,28 @@ restoreNapeFollow = function()
     Pins.LimbOriginals = {}
 end
 
-restoreNoAttack = function() syncTitans() end
-applyNoAttack   = function() syncTitans() end
+restoreNoAttack = function()
+    syncTitans()
+    if Pins.NoAggro then Pins.NoAggro:Disconnect(); Pins.NoAggro = nil end
+    pcall(function() local c = LocalPlayer.Character; if c then c:SetAttribute("IsInvisible", false) end end)
+end
+applyNoAttack   = function()
+    syncTitans()
+    -- ALSO pin IsInvisible=true on our character at ~2Hz. The decompiled TitanClass.CheckDetectors
+    -- reads it via a live GetAttribute (line 791) and returns BEFORE firing any move — for EVERY
+    -- titan, EVERY attack. That's the cheapest, most reliable bypass (one attribute vs shrinking
+    -- every detector part), so "No Attack" is now belt-and-suspenders: detectors shrunk (syncTitans)
+    -- AND IsInvisible. Note: IsInvisible also suppresses your footstep/build effects to others.
+    if Pins.NoAggro then Pins.NoAggro:Disconnect(); Pins.NoAggro = nil end
+    local accum = 0
+    Pins.NoAggro = RunService.Heartbeat:Connect(function(dt)
+        accum = accum + (dt or 0.016)
+        if accum < 0.5 then return end
+        accum = 0
+        local c = LocalPlayer.Character
+        if c then pcall(function() c:SetAttribute("IsInvisible", true) end) end
+    end)
+end
 
 -- Blade durability: brute force pin every common "durability" attribute name
 -- across Character + Backpack tools to BuffsState.BladeDura.target. Confirmed
@@ -1139,22 +1169,36 @@ restoreBladeDura = function()
 end
 applyBladeDura = function()
     restoreBladeDura()
-    Pins.BladeDura = RunService.Heartbeat:Connect(function()
+    local accum = 0
+    Pins.BladeDura = RunService.Heartbeat:Connect(function(dt)
+        -- Throttle to ~2Hz. Durability only drops when a swing LANDS, so re-pinning twice a second
+        -- is ample. The old version ran EVERY Heartbeat (~60Hz) over ~24 attribute names × every
+        -- tool = hundreds of SetAttribute bridge writes per frame — a major menu-lag source. ~30x less.
+        accum = accum + (dt or 0.016)
+        if accum < 0.5 then return end
+        accum = 0
         local target = BuffsState.BladeDura and BuffsState.BladeDura.target or 5
         local char = LocalPlayer.Character
         if char then
             for _, n in ipairs(BLADE_DURA_NAMES) do
                 pcall(function() char:SetAttribute(n, target) end)
-                for _, c in ipairs(char:GetChildren()) do
-                    if c:IsA("Tool") then
+            end
+            for _, c in ipairs(char:GetChildren()) do
+                if c:IsA("Tool") then
+                    for _, n in ipairs(BLADE_DURA_NAMES) do
                         pcall(function() c:SetAttribute(n, target) end)
                     end
                 end
             end
         end
-        for _, t in ipairs(LocalPlayer.Backpack:GetChildren()) do
-            for _, n in ipairs(BLADE_DURA_NAMES) do
-                pcall(function() t:SetAttribute(n, target) end)
+        local bp = LocalPlayer:FindFirstChild("Backpack")
+        if bp then
+            for _, t in ipairs(bp:GetChildren()) do
+                if t:IsA("Tool") then
+                    for _, n in ipairs(BLADE_DURA_NAMES) do
+                        pcall(function() t:SetAttribute(n, target) end)
+                    end
+                end
             end
         end
     end)
@@ -1199,13 +1243,15 @@ applyNapeFollow = function()
         local justEnded = (not touchable) and Pins._wasNapeTouchable
         Pins._wasNapeTouchable = touchable
 
-        -- PERF: per-frame titan scans + Size writes are the UI-lag culprit. They only matter
-        -- while a swing is live (touchable) or on its falling edge (justEnded restores there).
-        -- When idle (just riding around), drop to ~5Hz maintenance so the menu and game stay
-        -- smooth. Swing frames run at full speed below, so hits land exactly as before.
-        if (not touchable) and (not justEnded) then
+        -- PERF: the per-frame titan scan + nape Size/CFrame writes were a big lag source. Throttle
+        -- BOTH states through one accumulator — ~25Hz while swinging (plenty: the nape only has to
+        -- be in the swing volume at the hit frame) and ~5Hz idle maintenance — instead of running
+        -- every Heartbeat (60Hz+). The falling edge (justEnded) always runs so the nape snaps back
+        -- to tiny the instant the swing ends.
+        if not justEnded then
             napeIdleAccum = napeIdleAccum + (dt or 0.016)
-            if napeIdleAccum < 0.2 then return end
+            local interval = touchable and 0.04 or 0.2
+            if napeIdleAccum < interval then return end
             napeIdleAccum = 0
         else
             napeIdleAccum = 0
@@ -1232,7 +1278,7 @@ applyNapeFollow = function()
 
         for _, titan in ipairs(titans:GetChildren()) do
             local titanHrp = titan:FindFirstChild("HumanoidRootPart")
-            if titanHrp then
+            if titanHrp and not isTitanDead(titan) then   -- skip dead titans: no expander on corpses
                 local dist = (titanHrp.Position - myPos).Magnitude
                 if dist <= range then
                     local dp = titan:FindFirstChild("DamagePoints")
@@ -1288,29 +1334,12 @@ applyNapeFollow = function()
                                 end
                             end
                         end
-                        -- "ALWAYS NAPE": during the swing, make every OTHER hittable part
-                        -- (legs/arms/torso meshes + any non-extended damage point) un-hittable
-                        -- so the blade can only land on the nape. Restored when not swinging.
-                        -- The leg meshes are DIRECT children of the titan; DamagePoints.Nape/Eye
-                        -- live in the folder. One pcall per titan keeps the GC cost down.
-                        -- "ALWAYS NAPE": during the swing, SHRINK the titan's limb meshes to
-                        -- nothing so the blade can't land on a leg/arm. Size writes work in
-                        -- Matcha (CanTouch/CanQuery don't — they read nil) — this is the same
-                        -- trick the Musket Extender uses to kill the eye. Snapshot each limb's
-                        -- real size once; restored on the swing's falling edge + on toggle-off.
-                        if touchable then
-                            pcall(function()
-                                for _, c in ipairs(titan:GetDescendants()) do
-                                    if c:IsA("BasePart") then
-                                        local nm = c.Name
-                                        if nm:find("Leg") or nm:find("Arm") or nm:find("Foot") or nm:find("Hand") then
-                                            if not Pins.LimbOriginals[c] then Pins.LimbOriginals[c] = c.Size end
-                                            c.Size = Vector3.new(0.05, 0.05, 0.05)
-                                        end
-                                    end
-                                end
-                            end)
-                        end
+                        -- (Removed the per-frame GetDescendants limb-shrink — 2026-07-02. The game's
+                        -- HitboxClass.Solve only registers a titan hit on parts tagged "TitanHitbox"
+                        -- (the Nape/Eye damage points); the untagged limb meshes can NEVER be hit, so
+                        -- shrinking them did nothing but run GetDescendants + a Size write on every
+                        -- limb EVERY FRAME of every swing — the single biggest menu-lag source. The
+                        -- Nape being in the swing volume is all that's needed.)
                     end
                 end
             end
@@ -1330,9 +1359,12 @@ applyMusketExtender = function()
     restoreMusketExtender()
     local musketAccum = 0
     Pins.MusketExtender = RunService.Heartbeat:Connect(function(dt)
-        -- Throttle to ~25Hz (same reasoning as Hitbox Extender — per-frame is FPS death).
+        -- Throttle to ~15Hz. The ranged nape only needs repositioning as the titan walks, so
+        -- per-frame was overkill. Dropped the CanTouch/CanQuery writes — they read nil in Matcha
+        -- (no-ops that each still cost a bridge round-trip); the nape is raycast-hittable by
+        -- default (CanQuery is already true), so the musket still lands on it.
         musketAccum = musketAccum + (dt or 0.016)
-        if musketAccum < 0.04 then return end
+        if musketAccum < 0.066 then return end
         musketAccum = 0
         local world = Workspace:FindFirstChild("World")
         if not world then return end
@@ -1341,32 +1373,45 @@ applyMusketExtender = function()
         for _, titan in ipairs(titans:GetChildren()) do
             local dp  = titan:FindFirstChild("DamagePoints")
             local hrp = titan:FindFirstChild("HumanoidRootPart")
-            if dp and hrp then
-                -- Kill the eye so it can't steal the ranged hit
+            if dp and hrp and not isTitanDead(titan) then   -- skip dead titans: no musket nape on corpses
+                -- Shrink the eye so it can't steal the ranged hit
                 local eye = dp:FindFirstChild("Eye")
                 if eye and eye:IsA("BasePart") then
                     pcall(function() eye.Size = Vector3.new(0.05, 0.05, 0.05) end)
-                    pcall(function() eye.CanQuery = false end)
-                    pcall(function() eye.CanTouch = false end)
                 end
                 -- Nape = big cube enveloping titan center; the only ray-hittable target
                 local nape = dp:FindFirstChild("Nape")
                 if nape and nape:IsA("BasePart") then
                     pcall(function() nape.Anchored = true end)
                     pcall(function() nape.CanCollide = false end)
-                    pcall(function() nape.CanTouch = true end)
-                    pcall(function() nape.CanQuery = true end)   -- gun raycast can hit it
                     pcall(function() nape.Massless = true end)
                     pcall(function() nape.Size = Vector3.new(MUSKET_NAPE_SIZE, MUSKET_NAPE_SIZE, MUSKET_NAPE_SIZE) end)
                     pcall(function() nape.CFrame = CFrame.new(hrp.Position) end)
                     pcall(function() nape.Transparency = 1 end)
-                    pcall(function() nape.LocalTransparencyModifier = 1 end)
                 end
             end
         end
     end)
 end
 
+restoreNoFallDamage = function()
+    if Pins.NoFallDamage then Pins.NoFallDamage:Disconnect(); Pins.NoFallDamage = nil end
+    pcall(function() local c = LocalPlayer.Character; if c then c:SetAttribute("FallDamageImmune", false) end end)
+end
+applyNoFallDamage = function()
+    restoreNoFallDamage()
+    -- Pin FallDamageImmune=true on our character (~5Hz). CharacterLoader applies fall damage only
+    -- when this attribute is FALSE (the game's own OdmClass sets it true while hooking), so pinning
+    -- it true = no fall damage. One cheap attribute; 5Hz to beat the game's 0.25s reset-to-false.
+    local accum = 0
+    Pins.NoFallDamage = RunService.Heartbeat:Connect(function(dt)
+        accum = accum + (dt or 0.016)
+        if accum < 0.2 then return end
+        accum = 0
+        local c = LocalPlayer.Character
+        if c then pcall(function() c:SetAttribute("FallDamageImmune", true) end) end
+    end)
+end
 restoreCanRollUnlock = function()
     if Pins.CanRoll then Pins.CanRoll:Disconnect(); Pins.CanRoll = nil end
     -- Don't try to flip them back — that would lock you out of working talents
@@ -1974,6 +2019,14 @@ local function drawTitan(o, myPos)
     local dist = myPos and (pos - myPos).Magnitude or nil
     if dist and dist > TITAN_ESP.MaxDistance then hideTitanObj(o); return end
 
+    -- Dead titan → drop its ESP entirely. The game leaves the corpse in the Titans folder with
+    -- NapeHealth at 0/negative, so the old ESP lingered on the body forever. Death = NapeHealth <= 0
+    -- or the model's Dead attribute (the Humanoid reads a useless 100/inf, so it can't tell us).
+    local napeDead = tonumber(model:GetAttribute("NapeHealth"))
+    if (napeDead and napeDead <= 0) or model:GetAttribute("Dead") == true then
+        hideTitanObj(o); return
+    end
+
     local headS, onHead = project(pos + TITAN_HEAD_OFF)
     local footS, onFoot = project(pos - TITAN_FOOT_OFF)
     if not (headS and footS) or (not onHead and not onFoot) then hideTitanObj(o); return end
@@ -2170,6 +2223,7 @@ saveConfig = function()
             noAttack        = Features.NoAttack,
             bladeDura       = Features.BladeDura,
             canRollUnlock   = Features.CanRollUnlock,
+            noFallDamage    = Features.NoFallDamage,
             -- Persist user-entered target values
             targets = {
                 HookRange          = BuffsState.HookRange.target,
@@ -2244,6 +2298,7 @@ loadConfig = function()
         if type(b.noAttack)        == "boolean" then Features.NoAttack        = b.noAttack end
         if type(b.bladeDura)       == "boolean" then Features.BladeDura       = b.bladeDura end
         if type(b.canRollUnlock)   == "boolean" then Features.CanRollUnlock   = b.canRollUnlock end
+        if type(b.noFallDamage)    == "boolean" then Features.NoFallDamage    = b.noFallDamage end
         if type(b.targets) == "table" then
             for k, v in pairs(b.targets) do
                 if BuffsState[k] and type(v) == "number" and v > 0 then
@@ -2259,6 +2314,7 @@ resetConfig = function()
     Features.HorseBoost = false; Features.PlayerESP = false; Features.SprintSpeed = false
     Features.TitanESP = false; Features.TitanNapeMarker = true
     Features.HookRange = false; Features.GasConservation = false; Features.CanRollUnlock = false
+    Features.NoFallDamage = false
     Features.ReloadSpeed = false; Features.OdmVeloCap = false; Features.RunSpeed = false
     Features.NoGrab = false; Features.NoStomp = false; Features.NoBite = false
     Features.NapeFollow = false
@@ -2269,6 +2325,7 @@ resetConfig = function()
     Features.BladeDura = false
     NapeFollowRange = 60
     restoreHookRange(); restoreGasConservation(); restoreCanRollUnlock()
+    restoreNoFallDamage()
     restoreReloadSpeed(); restoreOdmVeloCap(); restoreRunSpeed()
     refreshAntiTitan()
     restoreNapeFollow()
@@ -2322,6 +2379,7 @@ local function UnloadScript()
     pcall(restoreNoAttack)
     pcall(restoreBladeDura)
     pcall(restoreCanRollUnlock)
+    pcall(restoreNoFallDamage)
     for _, el in ipairs(GUI.Elements)        do pcall(function() el:Remove() end) end
     for _, el in ipairs(GUI.ContentElements) do pcall(function() el:Remove() end) end
     for _, el in ipairs(GUI.SubTabElements)  do pcall(function() el:Remove() end) end
@@ -2507,7 +2565,15 @@ local ACK_DEFAULTS = {
 -- press "Pin Buffs". We keep the box objects so Reset can refresh their displayed text.
 local ackBoxes = {}
 local function ackStore(key, s)
-    local n = tonumber(s)
+    -- NUMBERS ONLY: strip anything that isn't a digit or a decimal point, and reflect the cleaned
+    -- value back into the box so typed letters never stick.
+    local raw = tostring(s)
+    local clean = raw:gsub("[^%d%.]", "")
+    if clean ~= raw then
+        local box = ackBoxes[key]
+        if box then if not pcall(function() box:Set(clean) end) then pcall(function() box:SetValue(clean) end) end end
+    end
+    local n = tonumber(clean)
     if n and n > 0 then
         local b = BuffsState[key]
         if b then b.target = math.min(n, b.max or 100000) end
@@ -2567,6 +2633,12 @@ secTitan:Toggle("Musket Extender", Features.MusketExtender, function(v)
 end):Tooltip("ranged nape envelop (musket/crossbow)")
 secTitan:Slider("Range", NapeFollowRange, 1, 30, 900, "", function(v) NapeFollowRange = v end)
 
+local secUtil = tabChar:Section("Utility", "Right", "Character")
+secUtil:Toggle("No Fall Damage", Features.NoFallDamage, function(v)
+    Features.NoFallDamage = v
+    if v then applyNoFallDamage() else restoreNoFallDamage() end
+end):Tooltip("pin FallDamageImmune=true — stop taking fall damage (client-side)")
+
 end  -- /Character tab
 -- ===== Tab: Tools (wrench) — opens the smooth Requiem-UI RS Diff panel =====
 -- RS Diff is the smooth immediate-mode floating window from the "REQUIEM UI" engine defined
@@ -2624,14 +2696,26 @@ if Features.NapeFollow then pcall(applyNapeFollow) end
 if Features.MusketExtender then pcall(applyMusketExtender) end
 if Features.NoAttack then pcall(applyNoAttack) end
 if Features.CanRollUnlock then pcall(applyCanRollUnlock) end
+if Features.NoFallDamage then pcall(applyNoFallDamage) end
 
 -- End key = full unload (the library owns F3 menu-toggle + F4 ESP).
+-- RELEASE-ARM GUARD (mirrors Menu.lua's CloseKeyReady): only unload AFTER the close key has
+-- been observed RELEASED at least once. Matcha can falsely report VK_END (0x23) as permanently
+-- held (an iskeypressed quirk — confirmed 2026-07-02: iskeypressed(0x23) returns true even when
+-- End isn't pressed). Without this guard the watcher sees a "press" on frame 1 and instantly
+-- calls UnloadScript on the freshly-built menu, so it never renders. Seeding from a released
+-- state makes a stuck-true key harmless, while a genuine End press still unloads normally.
 task.spawn(function()
-    local wasDown = false
+    local ready, wasDown = false, false
     while GUI.Running do
-        local ok, down = pcall(iskeypressed, 0x23)  -- VK_END
-        if ok and down and not wasDown then pcall(UnloadScript); return end
-        wasDown = ok and down or false
+        local ok, down = pcall(iskeypressed, GUI.CloseKey or 0x23)
+        down = ok and down or false
+        if ready then
+            if down and not wasDown then pcall(UnloadScript); return end
+        elseif not down then
+            ready = true
+        end
+        wasDown = down
         task.wait(0.05)
     end
 end)
