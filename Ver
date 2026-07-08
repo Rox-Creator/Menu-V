@@ -2477,7 +2477,7 @@ Lib:SetTheme({ accentA = YELLOW_A, accentB = YELLOW_B, bg = Color3.fromRGB(18, 1
 -- where the global `wonder_toggle` exists) relays a click back so flipping the app's rendered menu
 -- applies here. In-game `wonder_toggle` is nil, so for normal users this is a transparent no-op.
 do
-    local g = getgenv()
+    local g = (getgenv and getgenv()) or _G   -- Matcha may not expose getgenv(); _G is its shared global
     g.__wonder = g.__wonder or { features = {}, order = {} }
     g.__wonder_apply = function(name, value)
         local f = g.__wonder.features[name]
@@ -2544,7 +2544,7 @@ _G.MatchaCleanup = function() pcall(function() Lib:Destroy() end) end
 -- Wonder "Control in game": start with the on-screen menu HIDDEN (features still run) so the user
 -- drives toggles from the Wonder app without paying the in-game menu's render lag. Best-effort
 -- across the lib's possible hide APIs; a normal load leaves __wonder_headless nil and shows normally.
-if getgenv().__wonder_headless then
+if ((getgenv and getgenv()) or _G).__wonder_headless then
     pcall(function() window:SetVisible(false) end)
     pcall(function() window.Visible = false end)
     pcall(function() window:Hide() end)
