@@ -2497,26 +2497,39 @@ do
                         local origSection = tab.Section
                         tab.Section = function(t, ...)
                             local sec = origSection(t, ...)
-                            if type(sec) == "table" and type(sec.Toggle) == "function" then
-                                local origToggle = sec.Toggle
-                                sec.Toggle = function(s, label, default, cb, ...)
-                                    local obj, guard
-                                    local function wcb(v)
-                                        if guard then return end
-                                        if wonder_toggle then pcall(wonder_toggle, label, v) end
-                                        if cb then return cb(v) end
+                            if type(sec) == "table" then
+                                -- wrap Toggle/Slider/Button (cb is arg #3/#7/#2). In the Wonder preview the
+                                -- control RELAYS to the game only (wonder_toggle exists there); in-game it runs
+                                -- the real callback. __wonder_apply(label,val) drives it from the app.
+                                local function wrapCtl(method, cbPos, kind)
+                                    local orig = sec[method]
+                                    if type(orig) ~= "function" then return end
+                                    sec[method] = function(s, ...)
+                                        local n = select("#", ...)
+                                        local args = {...}
+                                        local label = args[1]
+                                        local cb = args[cbPos]
+                                        local obj, guard
+                                        local function wcb(v)
+                                            if guard then return end
+                                            if wonder_toggle then pcall(wonder_toggle, label, v)
+                                            elseif cb then return cb(v) end
+                                        end
+                                        args[cbPos] = wcb
+                                        obj = orig(s, table.unpack(args, 1, math.max(n, cbPos)))
+                                        if type(label) == "string" then
+                                            if g.__wonder.features[label] == nil then g.__wonder.order[#g.__wonder.order + 1] = label end
+                                            g.__wonder.features[label] = { type = kind, set = function(val)
+                                                if kind ~= "button" and type(obj) == "table" and type(obj.Set) == "function" then guard = true; pcall(function() obj:Set(val) end); guard = false end
+                                                if cb then pcall(cb, val) end
+                                            end }
+                                        end
+                                        return obj
                                     end
-                                    obj = origToggle(s, label, default, wcb, ...)
-                                    if g.__wonder.features[label] == nil then g.__wonder.order[#g.__wonder.order + 1] = label end
-                                    g.__wonder.features[label] = { type = "toggle", value = default and true or false, set = function(val)
-                                        val = val and true or false
-                                        guard = true
-                                        if type(obj) == "table" and type(obj.Set) == "function" then pcall(function() obj:Set(val) end) end
-                                        guard = false
-                                        if cb then pcall(cb, val) end
-                                    end }
-                                    return obj
                                 end
+                                wrapCtl("Toggle", 3, "toggle")
+                                wrapCtl("Slider", 7, "slider")
+                                wrapCtl("Button", 2, "button")
                             end
                             return sec
                         end
