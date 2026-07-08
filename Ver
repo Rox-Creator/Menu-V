@@ -2471,6 +2471,65 @@ local YELLOW_A = Color3.fromRGB(252, 211, 49)
 local YELLOW_B = Color3.fromRGB(240, 165, 25)
 Lib:SetTheme({ accentA = YELLOW_A, accentB = YELLOW_B, bg = Color3.fromRGB(18, 17, 13), sidebar = Color3.fromRGB(18, 17, 13) })
 
+-- ===== Wonder desktop-app bridge hook (Script view) ===================================
+-- Lets the Wonder app mirror this menu: every toggle registers a name->apply entry in
+-- getgenv().__wonder so the app can flip it in-game, and (ONLY inside Wonder's preview sandbox,
+-- where the global `wonder_toggle` exists) relays a click back so flipping the app's rendered menu
+-- applies here. In-game `wonder_toggle` is nil, so for normal users this is a transparent no-op.
+do
+    local g = getgenv()
+    g.__wonder = g.__wonder or { features = {}, order = {} }
+    g.__wonder_apply = function(name, value)
+        local f = g.__wonder.features[name]
+        if f and f.set then local ok = pcall(f.set, value); if ok then f.value = value end end
+    end
+    g.__wonder_unload = function() pcall(function() if _G.VERFALL and _G.VERFALL.unload then _G.VERFALL.unload() end end) end
+    if type(Lib) == "table" and type(Lib.CreateWindow) == "function" and not rawget(Lib, "__wonderWrapped") then
+        rawset(Lib, "__wonderWrapped", true)
+        local origCreate = Lib.CreateWindow
+        Lib.CreateWindow = function(self, ...)
+            local win = origCreate(self, ...)
+            if type(win) == "table" and type(win.Tab) == "function" then
+                local origTab = win.Tab
+                win.Tab = function(w, ...)
+                    local tab = origTab(w, ...)
+                    if type(tab) == "table" and type(tab.Section) == "function" then
+                        local origSection = tab.Section
+                        tab.Section = function(t, ...)
+                            local sec = origSection(t, ...)
+                            if type(sec) == "table" and type(sec.Toggle) == "function" then
+                                local origToggle = sec.Toggle
+                                sec.Toggle = function(s, label, default, cb, ...)
+                                    local obj, guard
+                                    local function wcb(v)
+                                        if guard then return end
+                                        if wonder_toggle then pcall(wonder_toggle, label, v) end
+                                        if cb then return cb(v) end
+                                    end
+                                    obj = origToggle(s, label, default, wcb, ...)
+                                    if g.__wonder.features[label] == nil then g.__wonder.order[#g.__wonder.order + 1] = label end
+                                    g.__wonder.features[label] = { type = "toggle", value = default and true or false, set = function(val)
+                                        val = val and true or false
+                                        guard = true
+                                        if type(obj) == "table" and type(obj.Set) == "function" then pcall(function() obj:Set(val) end) end
+                                        guard = false
+                                        if cb then pcall(cb, val) end
+                                    end }
+                                    return obj
+                                end
+                            end
+                            return sec
+                        end
+                    end
+                    return tab
+                end
+            end
+            return win
+        end
+    end
+end
+-- ======================================================================================
+
 local window = Lib:CreateWindow({
     title    = "Verfall",
     subtitle = "OUUU SOUURRR!",
@@ -2482,6 +2541,15 @@ local window = Lib:CreateWindow({
 })
 LibWindow = window
 _G.MatchaCleanup = function() pcall(function() Lib:Destroy() end) end
+-- Wonder "Control in game": start with the on-screen menu HIDDEN (features still run) so the user
+-- drives toggles from the Wonder app without paying the in-game menu's render lag. Best-effort
+-- across the lib's possible hide APIs; a normal load leaves __wonder_headless nil and shows normally.
+if getgenv().__wonder_headless then
+    pcall(function() window:SetVisible(false) end)
+    pcall(function() window.Visible = false end)
+    pcall(function() window:Hide() end)
+    pcall(function() Lib:SetVisible(false) end)
+end
 
 -- PERF: the ~1.2s periodic stutter IS the library autosave — every 1.2s it re-serializes
 -- the whole config and writefile()s it (a disk-write freeze). A SINGLE SetAutoSave(false)
