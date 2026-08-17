@@ -3380,35 +3380,34 @@ local function corpseSend(e)
         lines[#lines + 1] = string.format("%-26s x%d", it.name, it.amount)
     end
     if e.truncated then
-        lines[#lines + 1] = "... list cut off (game caps the read at 255 chars)"
+        lines[#lines + 1] = "Limit Reached."
     end
     local inv = (#lines > 0) and ("```\n" .. table.concat(lines, "\n") .. "\n```") or "_empty_"
 
-    -- Time of death. TimeOfDeath is a Unix epoch, which is exactly what Discord's <t:N:style>
-    -- token wants, so the client renders it in each viewer's OWN timezone.
-    --   F = full date+time ("Monday, 17 August 2026 10:23")
-    --   R = relative ("2 hours ago")
+    -- Time of death. TimeOfDeath is a Unix epoch, which is what Discord's <t:N:style> token
+    -- takes, so it renders in each viewer's OWN timezone. Style :S matches Menu.lua's death log
+    -- so both feeds read the same — a short stamp, not the full weekday-and-date form.
     -- The epoch MUST be emitted as an integer: we hand-roll the JSON precisely because Matcha's
     -- encoder would write it as 1786950537.0, and Discord would not parse that as a timestamp.
     local tod = tonumber(e.tod)
     local todText
     if tod and tod > 0 then
-        local n = math.floor(tod)
-        todText = string.format("<t:%d:F>  (<t:%d:R>)", n, n)
+        todText = string.format("<t:%d:S>", math.floor(tod))
     else
         todText = "_unknown_"
     end
 
+    -- No "Roblox Username" line here: the title already carries it, so repeating it was noise.
     local desc = table.concat({
-        "**Roblox Username:** `" .. ((e.user ~= "" and e.user) or "?") .. "`",
         "**Lore Name:** " .. ((e.lore ~= "" and e.lore) or "_none_"),
         "**Time of Death:** " .. todText,
     }, "\n")
 
     local body = table.concat({
         '{"embeds":[{',
-        -- title is the ROBLOX USERNAME (the account), not the in-game lore name
-        '"title":"',       corpseEsc((e.user ~= "" and e.user) or "(unknown user)"), '",',
+        -- Matches Menu.lua's death-log headline. NOTE: no ** ** markers — Discord does not render
+        -- markdown inside an embed TITLE, so asterisks would show up literally.
+        '"title":"',       corpseEsc("Player ( " .. ((e.user ~= "" and e.user) or "?") .. " ) Has died."), '",',
         '"description":"', corpseEsc(desc), '",',
         '"color":13120045,',                       -- 0xC8322D as a plain INTEGER literal
         '"fields":[{"name":"', corpseEsc("Inventory (" .. #(e.items or {}) .. ")"), '",',
