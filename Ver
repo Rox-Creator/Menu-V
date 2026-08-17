@@ -15,149 +15,50 @@ if _G.VERFALL and _G.VERFALL.unload then pcall(_G.VERFALL.unload) end
 local Players     = game:GetService("Players")
 local Workspace   = game:GetService("Workspace")
 local HttpService = game:GetService("HttpService")
-local UIS         = game:GetService("UserInputService")
 local RunService  = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 local Mouse       = LocalPlayer:GetMouse()
 
 local CONFIG_DIR       = "Verfall"
-local CONFIG_PATH      = CONFIG_DIR .. "/config.json"
 local RS_SNAPSHOT_PATH = CONFIG_DIR .. "/rs_snapshot.json"
 
--- ============================================================
--- PALETTE / CONFIG
--- ============================================================
-
-local Colors = {
-    WindowBg    = Color3.fromRGB(18, 18, 22),
-    HeaderBg    = Color3.fromRGB(26, 26, 30),
-    SubTabBg    = Color3.fromRGB(14, 14, 18),
-    FooterBg    = Color3.fromRGB(20, 20, 24),
-    CardBg      = Color3.fromRGB(22, 22, 26),
-    CardBorder  = Color3.fromRGB(14, 14, 18),
-    AccentRed   = Color3.fromRGB(220, 75, 75),
-    Accent      = Color3.fromRGB(220, 75, 75),
-    AccentDim   = Color3.fromRGB(175, 55, 55),
-    TextPrimary = Color3.fromRGB(220, 220, 225),
-    TextMuted   = Color3.fromRGB(100, 100, 110),
-    NavNormal   = Color3.fromRGB(120, 120, 130),
-    NavActive   = Color3.fromRGB(230, 230, 240),
-    Separator   = Color3.fromRGB(16, 16, 20),
-    Border      = Color3.fromRGB(8, 8, 10),
-    ToggleOn    = Color3.fromRGB(220, 75, 75),
-    ToggleOff   = Color3.fromRGB(38, 38, 44),
-    SliderFill  = Color3.fromRGB(220, 75, 75),
-    StatusOn    = Color3.fromRGB(80, 220, 140),
-    DiffAdd     = Color3.fromRGB(80, 220, 100),
-    DiffDel     = Color3.fromRGB(255, 80, 80),
-    DiffCls     = Color3.fromRGB(255, 165, 60),
-}
-
-local Config = {
-    WinW = 820, WinH = 560,
-    HeaderH = 40, SubTabH = 32, FooterH = 28,
-    Corner = 6,
-    ToggleW = 32, ToggleH = 16,
-    SliderH = 8,
-    RowHeight = 36, ContentPad = 20, ColGap = 16, CardPad = 14,
-}
-Config.ColW = math.floor((Config.WinW - Config.ContentPad * 2 - Config.ColGap) / 2)
-local SLIDER_ROW_H = 20 + Config.SliderH + 18
-
-do
-    local vpW, vpH = 2560, 1440
-    pcall(function()
-        local cam = Workspace.CurrentCamera
-        vpW, vpH = cam.ViewportSize.X, cam.ViewportSize.Y
-    end)
-    Config.WinX = math.floor((vpW - Config.WinW) / 2)
-    Config.WinY = math.floor((vpH - Config.WinH) / 2)
-end
+-- NOTE: the Colors palette and the Config geometry table that used to sit here are gone. They only
+-- ever fed the hand-rolled Drawing menu that INS-ui replaced — Config's remaining fields were
+-- computed from each other and read by nothing at all. The REQUIEM UI engine below carries its own
+-- palette in `T`.
 
 -- ============================================================
 -- STATE
 -- ============================================================
 
+-- Everything the old hand-rolled Drawing menu needed (element/clickable pools, drag offsets, nav
+-- buttons, per-VK input latches, the whole Enchants panel) is gone: the INS-ui library owns the
+-- window now, and those tables were never written to again — UnloadScript was looping over
+-- permanently empty lists.
 local GUI = {
-    Running          = true,
-    Visible          = true,
-    SelectedPage     = "Main",
-    SubTab           = "Elements",
-    Elements         = {},
-    ContentElements  = {},
-    SubTabElements   = {},
-    Clickables       = {},
-    SubTabClickables = {},
-    NavButtons       = {},
-    Dragging         = false,
-    DragOffsetX = 0, DragOffsetY = 0,
-    WasMouseDown     = false,
-    SliderDragging   = nil,
-    HintText         = nil,
-    MainTabUnderline = nil,
-    AnimToken        = 0,
-    ToggleKey        = 0x72,  -- F3
-    CloseKey         = 0x23,  -- End
-    ESPKey           = 0x73,  -- F4
-    WasToggleDown    = false,
-    WasCloseDown     = false,
-    WasESPDown       = false,
-    CloseKeyReady    = false,
-    ListeningForKey      = false,
-    ListeningForCloseKey = false,
-    ListeningForESPKey   = false,
-    -- Numeric input listening state (for buff value entry)
-    ActiveInput          = nil,   -- key of the buff currently being edited, e.g. "HookRange"
-    InputBuffer          = "",    -- digits typed so far
-    InputBlink           = 0,     -- cursor blink phase
-    InputLastKey         = {},    -- per-VK edge tracking
+    Running   = true,
+    ToggleKey = 0x72,  -- F3
+    CloseKey  = 0x23,  -- End
 
-    -- RS Diff state
-    RSSnapshot           = nil,
-    RSSnapshotCount      = 0,
-    RSSnapshotAt         = nil,
-    RSDiffResults        = nil,
-    RSDiffStatus         = "",
-    RSDiffScrollOffset   = 0,
-    RSOverwriteConfirmAt = nil,
-
-    -- RS Diff floating panel state
-    RSDiffOpen           = false,
-    RSDiffX              = 240,
-    RSDiffY              = 140,
-    RSDiffW              = 720,
-    RSDiffH              = 460,
-    RSDiffElements       = {},
-    RSDiffClickables     = {},
-    RSDiffDragging       = false,
-    RSDiffDragOffsetX    = 0,
-    RSDiffDragOffsetY    = 0,
-
-    -- Enchants floating panel state
-    EnchantsOpen         = false,
-    EnchantsX            = 200,
-    EnchantsY            = 100,
-    EnchantsW            = 1000,
-    EnchantsH            = 540,
-    EnchantsElements     = {},
-    EnchantsClickables   = {},
-    EnchantsDragging     = false,
-    EnchantsDragOffsetX  = 0,
-    EnchantsDragOffsetY  = 0,
-    EnchantsData         = nil,   -- list of { name, rarity, path }
-    EnchantsScrollOffset = 0,
-    EnchantsStatus       = "",
-    EnchantsRarityFilter = "All",
-    EnchantsModal        = nil,   -- { name, rarity, path } for popup
+    -- RS Diff state (the floating panel drawn by the REQUIEM UI engine below)
+    RSSnapshot         = nil,
+    RSSnapshotCount    = 0,
+    RSSnapshotAt       = nil,
+    RSDiffResults      = nil,
+    RSDiffStatus       = "",
+    RSDiffScrollOffset = 0,
+    RSDiffOpen         = false,
+    RSDiffX            = 240,
+    RSDiffY            = 140,
+    RSDiffW            = 720,
+    RSDiffH            = 460,
 }
 
 local Features = {
     HorseBoost  = false,
-    PlayerESP   = false,
     TitanESP        = false,  -- ESP on titans (box + HP + nape marker)
     TitanNapeMarker = true,   -- bright dot on each titan's nape (aim helper)
     TitanHPOnly     = false,  -- show ONLY the nape HP number (no box/name/marker)
-    SprintSpeed = false,
     -- Buffs (ClientInformation attribute pins - confirmed working 2026-06)
     HookRange      = false,  -- extended grapple range
     GasConservation= false,  -- slower gas drain
@@ -171,11 +72,9 @@ local Features = {
     NapeFollow     = false,  -- titan nape/eye follow player (one-shot kills) — SWORDS
     ExtendNape     = true,   -- Hitbox Expander: extend the Nape weakpoint (the one-tap target)
     ExtendEye      = true,   -- Hitbox Expander: extend the Eye weakpoint (optional; can steal hits)
-    MusketExtender = false,  -- titan nape envelops body + eye killed (ranged nape) — MUSKET/CROSSBOW
     NoAttack       = false,  -- disable titan Detectors (no attack triggers fire)
     BladeDura      = false,  -- brute force pin durability on tools (confirmed working)
     CanRollUnlock  = false,  -- flip CanRoll=true on all locked talent categories
-    NoFallDamage   = false,  -- pin FallDamageImmune=true on our character (no fall damage)
     -- Ported from the old unoptimized build 2026-07-30. The three anti-hitbox toggles below ride
     -- the SAME 3Hz Size-only re-assert as NoGrab/NoStomp/NoBite, so each costs ~nothing extra.
     -- "Kick" is a real hitbox on NORMAL titans too (live-verified: a Normal titan's Hitboxes folder
@@ -192,9 +91,6 @@ local Features = {
     NoAllHitboxes  = false,  -- disable EVERY hitbox part regardless of its name
     TitanCap       = false,  -- horde perf: only draw the closest N titans in the ESP
     AutoPin        = false,  -- re-pin every ClientInformation buff on a slow timer
-    HandlesBypass  = false,  -- pin HandlesBypass/ProtoHandlesBypass on your Tools
-    NeverStops     = false,  -- horse: re-pin speed + bust stalls (10Hz)
-    RunWithSword   = false,  -- don't get movement-locked while swinging (5Hz)
     VeloHUD        = false,  -- on-screen ODM velocity readout (own 12Hz loop)
 }
 
@@ -204,32 +100,20 @@ local NapeFollowRange = 60
 
 -- Buff pin state (Heartbeat connections + per-module list for CanRoll)
 local Pins = {
-    Hook    = nil,
-    Gas     = nil,
-    Reload  = nil,
-    VeloCap = nil,
-    Run     = nil,
-    AntiTitan = nil,        -- shared heartbeat for all 3 NoGrab/NoStomp/NoBite toggles
-    AntiTitanLoop = nil,    -- (unused since 2026-07-02 apply-once change; kept for back-compat)
+    Horse   = nil,          -- 1Hz watcher: re-pin the boost when the horse model changes
+    AntiTitanLoop = nil,    -- 2Hz Size-only re-assert for every anti-hitbox toggle
     -- NOTE: every *Originals store below is keyed by tostring(part.Address), NOT by the instance.
     -- Matcha hands back a fresh shim on every instance access, so an instance key never matches on a
     -- later pass. Values carry the shim: { part = <shim>, ...fields }.
     HitboxOriginals = {},   -- [addr] = {part, size} for restore-on-disable
     NapeFollow = nil,       -- heartbeat for nape-follow exploit (swords)
     NoAggro = nil,          -- heartbeat pinning our IsInvisible=true (No Attack master switch)
-    NoFallDamage = nil,     -- heartbeat pinning our FallDamageImmune=true
     NapeOriginals = {},     -- [addr] = {part, size, transparency, massless} for toggle-off restore
-    MusketExtender = nil,   -- heartbeat for ranged nape (musket/crossbow)
-    NoAttack = nil,         -- heartbeat for detector-disable
     DetectorOriginals = {}, -- [addr] = {part, size} for restore-on-disable
     BladeDura = nil,        -- heartbeat for blade durability brute pin
     CanRoll = nil,
     CanRollList = {},
     AutoPin = nil,          -- slow timer that re-writes every ClientInformation buff
-    HandlesBypass = nil,    -- slow timer pinning HandlesBypass on your Tools
-    NeverStops = nil,       -- horse anti-stall (10Hz)
-    RunWithSword = nil,     -- swing movement-lock defeat (5Hz)
-    MusketOriginals = {},   -- [addr] = {part,Size,Anchored,CanCollide,Massless,Transparency}
 }
 
 -- Auto Pin cadence (seconds between full re-pins). The whole point of pinning on a TIMER instead of
@@ -276,59 +160,22 @@ local Horse = {
     Orig      = {},
 }
 
--- Sprint: pins player.ClientInformation.RunSpeed while Shift+WASD held,
--- restores original when released. Same pattern as horse MaxSpeed.
-local Sprint = {
-    Speed  = 38,
-    Orig   = nil,
-    Active = false,
-}
-
-local PLAYER_ESP = {
-    Objects     = {},
-    ColorR = 255, ColorG = 255, ColorB = 255,
-    Color       = Color3.fromRGB(255, 255, 255),
-    MaxDistance = 100000,
-    -- Big-server perf cap: only draw the closest N players. This must not exceed Reg.HOT_P, or the
-    -- extra ones would be drawn from a stale, round-robin-refreshed position.
-    MaxRender   = 16,
-    ShowBox = true, ShowName = true, ShowDistance = true, ShowTracer = false, ShowNameBg = true,
-    ShowHealthBar = true,
-}
-local function espRecolor()
-    PLAYER_ESP.Color = Color3.fromRGB(PLAYER_ESP.ColorR, PLAYER_ESP.ColorG, PLAYER_ESP.ColorB)
-    PLAYER_ESP._colVer = (PLAYER_ESP._colVer or 0) + 1   -- bump → drawPlayer recolors once (no per-frame string build)
-end
-
-
 -- ============================================================
 -- HELPERS
 -- ============================================================
 
-local function IsInside(mx, my, x, y, w, h)
-    return mx >= x and mx <= x + w and my >= y and my <= y + h
-end
 local function toast(msg) pcall(function() notify(msg, "Verfall", 2) end) end
 
 -- Forward declarations.
-local saveConfig, loadConfig, resetConfig
+local resetConfig
 local applyHorseBoost, restoreHorse
-local applyHookRange, restoreHookRange
-local applyGasConservation, restoreGasConservation
-local applyReloadSpeed, restoreReloadSpeed
-local applyOdmVeloCap, restoreOdmVeloCap
-local applyRunSpeed, restoreRunSpeed
+local applyHorseWatch, restoreHorseWatch        -- re-pin when the horse model comes back
 local refreshAntiTitan  -- shared restart for grab/stomp/bite toggles
 local applyNapeFollow, restoreNapeFollow
-local applyMusketExtender, restoreMusketExtender
 local applyNoAttack, restoreNoAttack
 local applyBladeDura, restoreBladeDura
 local applyCanRollUnlock, restoreCanRollUnlock
-local applyNoFallDamage, restoreNoFallDamage
 local applyAutoPin, restoreAutoPin              -- slow re-pin of every ClientInformation buff
-local applyHandlesBypass, restoreHandlesBypass  -- Tool-only handles bypass (2Hz)
-local applyNeverStops, restoreNeverStops        -- horse anti-stall (10Hz)
-local applyRunWithSword, restoreRunWithSword    -- swing movement-lock defeat (5Hz)
 local applyVeloHUD, restoreVeloHUD              -- on-screen velocity readout (12Hz)
 local LibWindow    -- INS-ui window handle (set at startup; used by UnloadScript)
 
@@ -663,8 +510,6 @@ local function rsTimeAgo(savedAt)
     return math.floor(d / 86400) .. "d ago"
 end
 
-local RS_DIFF_COLORS = { ADD = Colors.DiffAdd, DEL = Colors.DiffDel, CLS = Colors.DiffCls }
-
 
 -- ============================================================
 -- REQUIEM UI — smooth immediate-mode RS Diff panel (ported from Menu.lua.bak)
@@ -918,9 +763,11 @@ end
 local HORSE_MAX_STAMINA = 600
 local HORSE_REGEN       = 50
 
-applyHorseBoost = function()
+-- `h` is optional: the watcher below has already resolved the horse, and re-resolving costs 3
+-- FindFirstChild round-trips it does not need to spend.
+applyHorseBoost = function(h)
     if not Features.HorseBoost then return end
-    local h = findHorse()
+    h = h or findHorse()
     if not h then return end
     if not Horse.SnapTaken then
         Horse.Orig = {
@@ -936,189 +783,129 @@ applyHorseBoost = function()
     pcall(function() h:SetAttribute("MaxSpeed",   Horse.MaxSpeed) end)
 end
 
--- Horse "Never Stops" and "Running With Sword" were removed 2026-06-15 for performance; re-ported
--- 2026-07-30 from the old build, but THROTTLED. The originals ran every Heartbeat: Never Stops
--- re-resolved the horse (3+ FindFirstChild round-trips) and read AssemblyLinearVelocity 60-144x/sec,
--- and Running With Sword wrote 2 attributes ~33x/sec whether or not you were swinging. Both are the
--- kind of per-frame bridge traffic that froze the old menu.
-
--- NEVER STOPS — keeps the horse from stalling. Two halves on one 10Hz timer:
---   (a) re-pin MaxSpeed/Stamina so the game can't quietly zero them mid-ride
---   (b) momentum: remember the last good heading and, if the horse has nearly stopped, push it back
---       up to speed along that heading
--- The horse and its root part are cached and only re-resolved every 2s (or when the ref dies).
-restoreNeverStops = function()
-    if Pins.NeverStops then Pins.NeverStops:Disconnect(); Pins.NeverStops = nil end
-    -- Undo the attribute half. We share Horse.Orig/SnapTaken with Infinite Stamina, so only put the
-    -- horse back if THAT feature isn't the one holding the boost (otherwise we'd fight it).
-    if not Features.HorseBoost then pcall(restoreHorse) end
+-- ⚠ RE-PIN ON RESPAWN. Despawning and re-summoning gives you a BRAND NEW model carrying factory
+-- attributes, and applyHorseBoost only ever ran from the toggle and at startup — so the boost
+-- silently died the first time you re-summoned and never came back. This watches for the model's
+-- IDENTITY changing (by address, since Matcha hands back a fresh shim on every access and comparing
+-- the shims themselves is always false) and re-applies immediately, plus a slow re-assert in case
+-- the server resets a value on mount.
+restoreHorseWatch = function()
+    if Pins.Horse then Pins.Horse:Disconnect(); Pins.Horse = nil end
+    Horse.LastAddr = nil
 end
-applyNeverStops = function()
-    restoreNeverStops()
-    local accum, reAccum = 0, 99          -- 99 => resolve on the very first tick, then every 2s
-    local horse, root, lastDir, lastMoveAt
-    Pins.NeverStops = RunService.Heartbeat:Connect(function(dt)
-        if not Features.NeverStops then return end     -- cheapest guard first
-        -- THROTTLE FIRST. The horse re-resolve below is 3+ bridge round-trips; running it above this
-        -- gate meant findHorse() fired on EVERY Heartbeat while you were unmounted (~570/sec), which
-        -- is the exact freeze pattern this file exists to avoid.
+applyHorseWatch = function()
+    restoreHorseWatch()
+    local accum, ticks = 0, 0
+    Pins.Horse = RunService.Heartbeat:Connect(function(dt)
+        if not Features.HorseBoost then return end       -- cheapest guard first
         accum = accum + (dt or 0.016)
-        if accum < 0.1 then return end                  -- 10Hz
+        if accum < 1 then return end                      -- 1Hz; 3 FindFirstChild is the whole cost
         accum = 0
-
-        -- Re-resolve on a 2s cadence, or immediately if the cached root died. Note the cooldown is
-        -- honoured even while UNMOUNTED (horse == nil), so standing around costs ~1 lookup / 2s
-        -- rather than one per tick.
-        reAccum = reAccum + 0.1
-        if reAccum >= 2 or (root and not root.Parent) then
-            reAccum = 0
-            horse = findHorse()
-            root = nil
-            lastDir = nil     -- drop the stale heading: re-resolving means a different/absent horse
-            if horse then
-                local ok, r = pcall(function()
-                    return horse.PrimaryPart or horse:FindFirstChild("HumanoidRootPart")
-                        or horse:FindFirstChild("Torso")
-                end)
-                root = ok and r or nil
-            end
+        local h = findHorse()
+        if not h then
+            -- Gone. Drop the snapshot so the NEXT horse records its own factory values instead of
+            -- inheriting a dead model's — otherwise "Restore" would write stale numbers.
+            Horse.LastAddr, Horse.SnapTaken, Horse.Orig = nil, false, {}
+            return
         end
-        if not (horse and root) then return end
-
-        -- Snapshot BEFORE the first write, reusing Infinite Stamina's slot, so restoreHorse can put
-        -- the real values back. Without this, enabling Never Stops alone left the horse permanently
-        -- boosted (restoreHorse early-returns unless SnapTaken) and a later Infinite Stamina toggle
-        -- would snapshot our own modified value as the "original".
-        if not Horse.SnapTaken then
-            Horse.Orig = {
-                MaxStamina = num(horse:GetAttribute("MaxStamina"), 600),
-                RegenRate  = num(horse:GetAttribute("RegenRate"), 50),
-                MaxSpeed   = num(horse:GetAttribute("MaxSpeed"), 65),
-            }
-            Horse.SnapTaken = true
+        local a
+        pcall(function() a = tostring(h.Address) end)
+        if a and a ~= Horse.LastAddr then
+            Horse.LastAddr  = a
+            Horse.SnapTaken = false                       -- new model -> fresh snapshot
+            Horse.Orig      = {}
+            ticks = 0
+            applyHorseBoost(h)                            -- re-pin the moment it reappears
+            return
         end
-
-        pcall(function() horse:SetAttribute("MaxSpeed", Horse.MaxSpeed) end)
-        pcall(function() horse:SetAttribute("Stamina",  HORSE_MAX_STAMINA) end)
-        local ok, vel = pcall(function() return root.AssemblyLinearVelocity end)
-        if not ok or not vel then return end
-        local flatX, flatZ = vel.X, vel.Z
-        local mag = math.sqrt(flatX * flatX + flatZ * flatZ)
-        if mag > 8 then
-            lastDir = { x = flatX / mag, z = flatZ / mag }   -- moving: remember the heading
-            lastMoveAt = os.clock()
-        elseif lastDir and (os.clock() - (lastMoveAt or 0)) < 1.5 then
-            -- Stalled while we had a RECENT heading -> shove it back up to speed.
-            -- The 1.5s window matters: findHorse resolves your horse BY NAME, not by who is riding
-            -- it, so without it a horse you dismounted would keep getting pushed and run off on its
-            -- own. A real stall is resolved within a moment; parking for longer than that stops.
-            local sp = Horse.MaxSpeed or 65
-            pcall(function()
-                root.AssemblyLinearVelocity = Vector3.new(lastDir.x * sp, vel.Y, lastDir.z * sp)
-            end)
-        end
+        -- Same horse: re-assert every 3s rather than every second, so a parked horse costs ~1.3
+        -- attribute writes/sec instead of 4.
+        ticks = ticks + 1
+        if ticks >= 3 then ticks = 0; applyHorseBoost(h) end
     end)
 end
 
--- RUNNING WITH SWORD — really "don't get movement-locked while swinging". The swing sets
--- Character.DisableDirectionalMovement = true to freeze your movement for its duration; pinning it
--- false keeps full run speed through the swing. 5Hz (2 writes per 0.2s) instead of the old ~33Hz.
-restoreRunWithSword = function()
-    if Pins.RunWithSword then Pins.RunWithSword:Disconnect(); Pins.RunWithSword = nil end
-    -- DisableDirectionalMovement self-heals (the game re-asserts it on the next swing), but nothing
-    -- ever clears HandlesOut, so we must — otherwise the character is stuck weapon-drawn with the
-    -- toggle showing OFF.
-    local char = LocalPlayer.Character
-    if char then pcall(function() char:SetAttribute("HandlesOut", false) end) end
+-- ============================================================
+-- VELO HUD — a single line of plain white text: [ 185 ]
+-- ============================================================
+-- Drag it anywhere with the left mouse button WHILE THE MENU IS OPEN. Gating on the menu matters:
+-- M1 is your attack button, so a HUD that could be grabbed at any time would swallow swings.
+-- The position persists to its own small file, same approach as the webhook URL — the UI library's
+-- config only knows about its own controls, and a dragged screen position is not one.
+local VELO = {
+    gen = 0, o = nil,           -- generation token + the Drawing object
+    x = nil, y = nil,           -- nil = "not placed yet", resolved to a default on first draw
+    saveAt = nil,               -- debounced write (dragging fires continuously)
+    Path = CONFIG_DIR .. "/velohud.txt",
+    drag = false, dx = 0, dy = 0,
+    last = nil,                 -- last rendered string, so we only write .Text when it changes
+}
+
+function VELO.load()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    local exists = false
+    pcall(function() exists = isfile(VELO.Path) end)
+    if not exists then return end
+    local ok, raw = pcall(readfile, VELO.Path)
+    if not (ok and type(raw) == "string") then return end
+    local x, y = raw:match("^%s*(-?%d+%.?%d*)%s*,%s*(-?%d+%.?%d*)")
+    x, y = tonumber(x), tonumber(y)
+    if x and y then VELO.x, VELO.y = x, y end
 end
-applyRunWithSword = function()
-    restoreRunWithSword()
-    local accum = 0
-    Pins.RunWithSword = RunService.Heartbeat:Connect(function(dt)
-        if not Features.RunWithSword then return end
-        accum = accum + (dt or 0.016)
-        if accum < 0.2 then return end                  -- 5Hz
-        accum = 0
-        local char = LocalPlayer.Character
-        if not char then return end
-        pcall(function() char:SetAttribute("DisableDirectionalMovement", false) end)
-        pcall(function() char:SetAttribute("HandlesOut", true) end)
+
+function VELO.save()
+    if type(writefile) ~= "function" or not (VELO.x and VELO.y) then return end
+    pcall(function()
+        if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
+            makefolder(CONFIG_DIR)
+        end
     end)
+    pcall(writefile, VELO.Path, string.format("%d,%d", math.floor(VELO.x), math.floor(VELO.y)))
 end
 
--- VELO HUD — bottom-centre readout of your live ODM velocity: CURRENT (colour-graded), PEAK, and a
--- meter bar filling toward 500. Ported 2026-07-30. Runs on its OWN 12Hz task.spawn loop rather than
--- the 144Hz ESP render loop — a speed number redrawn 144x/sec is unreadable and costs a velocity
--- read every frame. Drawing objects are built once and reused; the Text strings are only rebuilt
--- when the displayed integer actually changes (same cache-the-string trick the ESP uses).
-local VeloHUD = { gen = 0, o = nil, peak = 0, lastCur = nil, lastPeak = nil }
-
-local function veloHudDestroy()
-    local o = VeloHUD.o
-    if not o then return end
-    for _, el in pairs(o) do pcall(function() el:Remove() end) end
-    VeloHUD.o = nil
-end
+VELO.load()
 
 restoreVeloHUD = function()
-    VeloHUD.gen = VeloHUD.gen + 1     -- invalidate any running loop
-    veloHudDestroy()
-    VeloHUD.peak = 0
-    VeloHUD.lastCur, VeloHUD.lastPeak = nil, nil
+    VELO.gen = VELO.gen + 1                    -- invalidate any running loop
+    if VELO.o then pcall(function() VELO.o:Remove() end); VELO.o = nil end
+    VELO.last, VELO.drag = nil, false
+    if VELO.saveAt then VELO.saveAt = nil; VELO.save() end   -- flush a pending drag before stopping
 end
 
 applyVeloHUD = function()
     restoreVeloHUD()
-    VeloHUD.gen = VeloHUD.gen + 1
-    local myGen = VeloHUD.gen
+    VELO.gen = VELO.gen + 1
+    local myGen = VELO.gen
 
-    local function mk(kind, z)
-        local ok, el = pcall(Drawing.new, kind)
-        if not ok or not el then return nil end
-        el.Visible = false
-        el.ZIndex = z
-        return el
-    end
-    local o = {
-        bg   = mk("Square", 90),
-        bar  = mk("Square", 92),
-        fill = mk("Square", 93),
-        cur  = mk("Text", 94),
-        peak = mk("Text", 94),
-        tag  = mk("Text", 94),
-    }
-    if not (o.bg and o.bar and o.fill and o.cur and o.peak and o.tag) then
-        for _, el in pairs(o) do pcall(function() el:Remove() end) end
-        return
-    end
-    o.bg.Filled = true;   o.bg.Color = Color3.fromRGB(14, 14, 18);  o.bg.Transparency = 0.82
-    o.bar.Filled = true;  o.bar.Color = Color3.fromRGB(32, 32, 40)
-    o.fill.Filled = true; o.fill.Color = Color3.fromRGB(90, 180, 255)
-    for _, t in ipairs({ o.cur, o.peak, o.tag }) do
-        t.Center = true; t.Outline = false; t.Font = Drawing.Fonts.SystemBold
-    end
-    o.cur.Size = 26; o.peak.Size = 13; o.tag.Size = 11
-    o.cur.Color = Color3.fromRGB(235, 235, 240)
-    o.peak.Color = Color3.fromRGB(100, 176, 255)
-    o.tag.Color = Color3.fromRGB(130, 130, 145)
-    o.tag.Text = "VELOCITY"          -- constant: set once here, never in the loop
-    VeloHUD.o = o
-    local shown, lastBand = false, nil
+    local ok, t = pcall(function()
+        local d = Drawing.new("Text")
+        d.Size = 15
+        d.Center = false
+        d.Outline = true                        -- 1px outline; plain white is unreadable on snow
+        d.Font = Drawing.Fonts.System
+        d.Color = Color3.fromRGB(255, 255, 255)
+        d.ZIndex = 90
+        d.Visible = false
+        return d
+    end)
+    if not (ok and t) then return end
+    VELO.o = t
 
     task.spawn(function()
         local vpW, vpH, vpAccum = 1920, 1080, 99
-        while VeloHUD.gen == myGen and GUI.Running do
-            if not Features.VeloHUD then break end
-            -- viewport only changes on a resize -> re-read every ~2s, not every tick
+        local wasDown = false
+        while VELO.gen == myGen and GUI.Running and Features.VeloHUD do
+            -- viewport only changes on a resize; re-read every ~2s rather than every tick
             vpAccum = vpAccum + 1
             if vpAccum >= 24 then
                 vpAccum = 0
                 pcall(function()
-                    local cam = Workspace.CurrentCamera        -- capital-W local, like the rest of the file
+                    local cam = Workspace.CurrentCamera
                     local vp = cam and cam.ViewportSize
                     if vp then vpW, vpH = vp.X, vp.Y end
                 end)
             end
+            if not (VELO.x and VELO.y) then VELO.x, VELO.y = vpW * 0.5 - 30, vpH - 120 end
 
             local speed = 0
             pcall(function()
@@ -1129,52 +916,50 @@ applyVeloHUD = function()
                     speed = math.sqrt(v.X * v.X + v.Y * v.Y + v.Z * v.Z)
                 end
             end)
-            if speed > VeloHUD.peak then VeloHUD.peak = speed end
 
-            local w, h = 210, 62
-            local x, y = (vpW - w) * 0.5, vpH - h - 70
-            o.bg.Position = Vector2.new(x, y);            o.bg.Size = Vector2.new(w, h)
-            o.bar.Position = Vector2.new(x + 14, y + h - 14); o.bar.Size = Vector2.new(w - 28, 5)
-            local pct = math.max(0, math.min(1, speed / 500))
-            o.fill.Position = Vector2.new(x + 14, y + h - 14)
-            o.fill.Size = Vector2.new(math.max(1, (w - 28) * pct), 5)
+            local s = "[ " .. math.floor(speed + 0.5) .. " ]"
+            if VELO.last ~= s then VELO.last = s; t.Text = s end
 
-            local curI = math.floor(speed + 0.5)
-            local walking = speed < 50            -- below 50 you're on foot, not grappling
-            -- Cache the RENDERED STRING, not curI: the text depends on `walking` too, and both 49.7
-            -- and 50.2 floor to 50 — keying on the integer alone would leave "walking" on screen
-            -- after you crossed the threshold (while the colour band correctly flipped).
-            local curTxt = walking and "walking" or tostring(curI)
-            if VeloHUD.lastCur ~= curTxt then
-                VeloHUD.lastCur = curTxt
-                o.cur.Text = curTxt
+            -- DRAG, only while the menu is open. ismouse1pressed is executor-local and free, so
+            -- polling it costs nothing; the menu check keeps M1 usable as the attack button.
+            local menuOpen = false
+            pcall(function() menuOpen = (LibWindow and LibWindow:IsOpen()) and true or false end)
+            local down = false
+            if menuOpen then pcall(function() down = ismouse1pressed() end) end
+            if menuOpen and down then
+                local mx, my = Mouse.X, Mouse.Y
+                if not wasDown then
+                    -- grab test: approximate the text box from the string length (Matcha's Drawing
+                    -- exposes no TextBounds), padded so it is comfortable to hit
+                    local w, h = #s * t.Size * 0.62 + 8, t.Size + 8
+                    if mx >= VELO.x - 4 and mx <= VELO.x + w and my >= VELO.y - 4 and my <= VELO.y + h then
+                        VELO.drag, VELO.dx, VELO.dy = true, mx - VELO.x, my - VELO.y
+                    end
+                elseif VELO.drag then
+                    VELO.x, VELO.y = mx - VELO.dx, my - VELO.dy
+                    VELO.x = math.max(0, math.min(VELO.x, vpW - 20))
+                    VELO.y = math.max(0, math.min(VELO.y, vpH - 20))
+                    VELO.saveAt = os.clock() + 0.6      -- debounce: one write when you let go
+                end
+            elseif VELO.drag then
+                VELO.drag = false
             end
-            -- recolour only when the speed band actually changes, not every tick
-            local band = walking and 0 or (speed >= 300 and 3 or (speed >= 180 and 2 or 1))
-            if lastBand ~= band then
-                lastBand = band
-                o.cur.Color = (band == 0 and Color3.fromRGB(120, 120, 132))
-                    or (band == 3 and Color3.fromRGB(255, 90, 90))
-                    or (band == 2 and Color3.fromRGB(245, 200, 72))
-                    or Color3.fromRGB(235, 235, 240)
-            end
-            o.cur.Position = Vector2.new(x + w * 0.5, y + 10)
+            wasDown = down
 
-            local peakI = math.floor(VeloHUD.peak + 0.5)
-            if VeloHUD.lastPeak ~= peakI then
-                VeloHUD.lastPeak = peakI
-                o.peak.Text = "peak " .. peakI
+            if VELO.saveAt and os.clock() >= VELO.saveAt then
+                VELO.saveAt = nil
+                VELO.save()
             end
-            o.peak.Position = Vector2.new(x + w * 0.5, y + 38)
-            o.tag.Position = Vector2.new(x + w * 0.5, y - 2)
 
-            if not shown then                        -- .Visible never changes after the first tick
-                shown = true
-                for _, el in pairs(o) do el.Visible = true end
-            end
-            task.wait(1 / 12)
+            t.Position = Vector2.new(math.floor(VELO.x), math.floor(VELO.y))
+            if not t.Visible then t.Visible = true end
+            -- 20Hz while idle is plenty for a number; 60Hz while dragging so it tracks the cursor.
+            task.wait(VELO.drag and (1 / 60) or (1 / 20))
         end
-        if VeloHUD.gen == myGen then veloHudDestroy() end
+        if VELO.gen == myGen then
+            if VELO.o then pcall(function() VELO.o:Remove() end); VELO.o = nil end
+            if VELO.saveAt then VELO.saveAt = nil; VELO.save() end
+        end
     end)
 end
 
@@ -1186,65 +971,6 @@ end
 -- ============================================================
 
 -- Buff target values now live in BuffsState[key].target (user-editable via UI)
-
-local function makeAttrPin(attrName, key)
-    -- NOTE: this per-buff pin is superseded by Auto Pin (one timer for all 9 buffs) and currently has
-    -- no callers — applyHookRange/GasConservation/ReloadSpeed/OdmVeloCap/RunSpeed are orphaned, though
-    -- their restore* partners are still invoked by resetConfig/UnloadScript, so the pair stays.
-    -- It is throttled anyway: unthrottled it was 2 bridge round-trips per frame PER BUFF (~600/sec),
-    -- and leaving that armed for whoever re-wires it later is exactly the landmine this file removed.
-    local accum = 0
-    return RunService.Heartbeat:Connect(function(dt)
-        accum = accum + (dt or 0.016)
-        if accum < 0.5 then return end
-        accum = 0
-        local ci = LocalPlayer:FindFirstChild("ClientInformation")
-        if not ci then return end
-        local b = BuffsState[key]
-        if not b then return end
-        pcall(function() ci:SetAttribute(attrName, b.target) end)
-    end)
-end
-
-restoreHookRange = function()
-    if Pins.Hook then Pins.Hook:Disconnect(); Pins.Hook = nil end
-end
-applyHookRange = function()
-    restoreHookRange()
-    Pins.Hook = makeAttrPin("HookRange", "HookRange")
-end
-
-restoreGasConservation = function()
-    if Pins.Gas then Pins.Gas:Disconnect(); Pins.Gas = nil end
-end
-applyGasConservation = function()
-    restoreGasConservation()
-    Pins.Gas = makeAttrPin("GasConservation", "GasConservation")
-end
-
-restoreReloadSpeed = function()
-    if Pins.Reload then Pins.Reload:Disconnect(); Pins.Reload = nil end
-end
-applyReloadSpeed = function()
-    restoreReloadSpeed()
-    Pins.Reload = makeAttrPin("ReloadSpeed", "ReloadSpeed")
-end
-
-restoreOdmVeloCap = function()
-    if Pins.VeloCap then Pins.VeloCap:Disconnect(); Pins.VeloCap = nil end
-end
-applyOdmVeloCap = function()
-    restoreOdmVeloCap()
-    Pins.VeloCap = makeAttrPin("OdmVeloCap", "OdmVeloCap")
-end
-
-restoreRunSpeed = function()
-    if Pins.Run then Pins.Run:Disconnect(); Pins.Run = nil end
-end
-applyRunSpeed = function()
-    restoreRunSpeed()
-    Pins.Run = makeAttrPin("RunSpeed", "RunSpeed")
-end
 
 -- Titan Anti-Hitbox + No-Attack (part-based, ported from Verfall Old — the proven method).
 -- Each titan MODEL holds a "Hitboxes" folder (LeftGrab/RightGrab/LeftStomp/RightStomp/Bite)
@@ -1308,11 +1034,9 @@ end
 -- access, so an instance key never matches on a later pass).
 local Reg = {
     titans = {}, tList = {}, tFolder = nil, tScanAt = 0, tRR = 0, tAttrRR = 0,
-    players = {}, pList = {}, pFolder = nil, pScanAt = 0, pRR = 0, pHpRR = 0,
     myPos = nil,
     HZ         = 15,   -- registry tick rate
     HOT_T      = 20,   -- titans whose position refreshes EVERY tick (nearest first)
-    HOT_P      = 16,   -- players likewise
     SWEEP      = 6,    -- cold entries refreshed per tick, round-robin
     ATTR_SWEEP = 5,    -- entries whose attributes refresh per tick, round-robin
     NAPE_HOT   = 10,   -- titans whose nape position is tracked (aim marker)
@@ -1528,56 +1252,9 @@ Reg.rescanTitans = function()
     Reg.tList = list
 end
 
-Reg.rescanPlayers = function()
-    Reg.pFolder = Reg.folder(Reg.pFolder, "Characters")
-    local f = Reg.pFolder
-    local store = Reg.players
-    if not f then
-        for n, e in pairs(store) do
-            if Reg.onDrop then pcall(Reg.onDrop, e) end
-            store[n] = nil
-        end
-        Reg.pList = {}
-        return
-    end
-    local kids; local ok = pcall(function() kids = f:GetChildren() end)
-    if not ok or type(kids) ~= "table" then return end
-    local myName = LocalPlayer.Name
-    local seen = {}
-    for i = 1, #kids do
-        local m = kids[i]
-        local nm; pcall(function() nm = m.Name end)
-        if nm and nm ~= myName then
-            seen[nm] = true
-            local a = Reg.addr(m)
-            local e = store[nm]
-            if not e then
-                store[nm] = { name = nm, model = m, addr = a }
-            elseif a and e.addr ~= a then
-                -- Respawned: same player, BRAND NEW character model. Every cached ref is stale, so
-                -- drop them all — including displayName, which previously latched for the session
-                -- and so kept showing the old character's label after a respawn.
-                e.model, e.addr = m, a
-                e.hrp, e.hum, e.displayName, e.pos, e.sx = nil, nil, nil, nil, nil
-            else
-                e.model = m
-            end
-        end
-    end
-    for n, e in pairs(store) do
-        if not seen[n] then
-            if Reg.onDrop then pcall(Reg.onDrop, e) end
-            store[n] = nil
-        end
-    end
-    local list = {}
-    for _, e in pairs(store) do list[#list + 1] = e end
-    Reg.pList = list
-end
-
 -- Which consumers currently need the titan half sampled at all.
 Reg.wantTitans = function()
-    return Features.TitanESP or Features.NapeFollow or Features.MusketExtender
+    return Features.TitanESP or Features.NapeFollow
         or Features.NoGrab or Features.NoStomp or Features.NoBite or Features.NoAttack
         or Features.NoKick or Features.NoPunch or Features.NoSwing or Features.NoAllHitboxes
 end
@@ -1594,23 +1271,19 @@ Reg.sweep = function(list, n, hot, cursor, count, fn, arg)
 end
 
 Reg.tick = function()
-    local wantT, wantP = Reg.wantTitans(), Features.PlayerESP
+    local wantT = Reg.wantTitans()
     -- Costs literally nothing while every consumer is off — no point resolving our own position for
     -- an empty world view. (The loop stays alive so toggling a feature takes effect on the next tick.)
-    if not (wantT or wantP) then
-        if #Reg.tList > 0 or #Reg.pList > 0 then
+    if not wantT then
+        if #Reg.tList > 0 then
             for a, e in pairs(Reg.titans) do Reg.dropTitan(a, e) end
-            for nm, e in pairs(Reg.players) do
-                if Reg.onDrop then pcall(Reg.onDrop, e) end
-                Reg.players[nm] = nil
-            end
-            Reg.tList, Reg.pList = {}, {}
+            Reg.tList = {}
         end
         return
     end
 
-    -- Our own root position: ONE resolve per tick, shared by the ESP, the expander, the musket
-    -- extender and the anti-hitbox range gate. Each of those used to resolve it independently.
+    -- Our own root position: ONE resolve per tick, shared by the ESP, the expander and the
+    -- anti-hitbox range gate. Each of those used to resolve it independently.
     local myPos = nil
     local char = LocalPlayer.Character
     local hrp = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
@@ -1667,76 +1340,6 @@ Reg.tick = function()
     elseif #Reg.tList > 0 then
         for a, e in pairs(Reg.titans) do Reg.dropTitan(a, e) end
         Reg.tList = {}
-    end
-
-    if wantP then
-        if nowc >= Reg.pScanAt then
-            Reg.pScanAt = nowc + Reg.SCAN_EVERY
-            Reg.rescanPlayers()
-        end
-        local list = Reg.pList
-        local n = #list
-        if n > 0 then
-            -- Resolve refs + the name label for at most a few players per tick. Unbounded, this
-            -- was a burst of 2-3 FindFirstChild PER PLAYER on the same tick — the "steady ~1s
-            -- stutter" in a full server. `displayName` latches to `false` when a character has no
-            -- FirstName, so a missing one is looked up once, not forever; rescanPlayers clears it
-            -- on respawn so it can never go stale.
-            local budget = 4
-            for i = 1, n do
-                local e = list[i]
-                if budget <= 0 then break end
-                local m = e.model
-                if m and not e.hrp then
-                    budget = budget - 1
-                    e.hrp = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
-                end
-                if m and e.displayName == nil then
-                    budget = budget - 1
-                    local fn; pcall(function() fn = m:GetAttribute("FirstName") end)
-                    if fn == nil then
-                        local fc = m:FindFirstChild("FirstName")
-                        if fc then pcall(function() fn = fc.Value end) end
-                    end
-                    e.displayName = (type(fn) == "string" and fn ~= "") and (fn .. " (" .. e.name .. ")") or false
-                end
-            end
-            table.sort(list, Reg.byDist)
-            local hot = n < Reg.HOT_P and n or Reg.HOT_P
-            for i = 1, hot do Reg.samplePos(list[i], myPos) end
-            Reg.pRR = Reg.sweep(list, n, hot, Reg.pRR, Reg.SWEEP, Reg.samplePos, myPos)
-            -- Health: round-robin over the drawn set. Was 3 reads per player per RENDER FRAME.
-            for _ = 1, 3 do
-                Reg.pHpRR = Reg.pHpRR + 1
-                if Reg.pHpRR > hot then Reg.pHpRR = 1 end
-                local e = list[Reg.pHpRR]
-                if e then
-                    local hum = e.hum
-                    if not hum then
-                        hum = e.model and e.model:FindFirstChildWhichIsA("Humanoid") or nil
-                        e.hum = hum
-                    end
-                    if hum then
-                        local ok, h, mh = pcall(function() return hum.Health, hum.MaxHealth end)
-                        if ok then
-                            h, mh = tonumber(h) or 0, tonumber(mh) or 0
-                            local pct = mh > 0 and math.max(0, math.min(1, h / mh)) or 0
-                            if e.hpPct ~= pct then
-                                e.hpPct = pct
-                                e.hpColor = Color3.fromRGB(math.floor(255 * (1 - pct)), math.floor(220 * pct), 60)
-                            end
-                            e.hpStr = tostring(math.floor(h + 0.5))
-                        end
-                    end
-                end
-            end
-        end
-    elseif #Reg.pList > 0 then
-        for nm, e in pairs(Reg.players) do
-            if Reg.onDrop then pcall(Reg.onDrop, e) end
-            Reg.players[nm] = nil
-        end
-        Reg.pList = {}
     end
 end
 
@@ -2040,48 +1643,6 @@ applyAutoPin = function()
     end)
 end
 
--- HANDLES BYPASS — pin HandlesBypass/ProtoHandlesBypass so weapons work without the normal
--- "handles" requirement. The old build wrote BOTH attributes on EVERY child of Character and
--- Backpack at 20Hz — in AoT that is all R15 limbs, Humanoid, HumanoidRootPart, Animate and every
--- accessory (~50 pointless writes per tick, the most expensive feature in that file). Here we
--- filter to :IsA("Tool") (~4 targets, which was plainly the intent) and re-assert at 2Hz, so it
--- survives tool swaps and server pushes for ~8 writes/sec instead of ~1000.
--- Shared by apply + restore so turning the toggle off actually CLEARS the flags instead of just
--- stopping the loop (the file's restore* convention: disconnect AND undo the write).
--- `IsA("Tool") == true` is deliberate: Matcha's IsA can return a truthy non-boolean, and a plain
--- truthy test would fail OPEN and write to all ~26 Character children — the old build's flood.
-local function handlesBypassWrite(on)
-    local function doBag(bag)
-        if not bag then return end
-        for _, t in ipairs(bag:GetChildren()) do
-            if t:IsA("Tool") == true then
-                pcall(function() t:SetAttribute("HandlesBypass", on) end)
-                pcall(function() t:SetAttribute("ProtoHandlesBypass", on) end)
-            end
-        end
-    end
-    doBag(LocalPlayer.Character)
-    doBag(LocalPlayer:FindFirstChild("Backpack"))
-end
-
-restoreHandlesBypass = function()
-    if Pins.HandlesBypass then Pins.HandlesBypass:Disconnect(); Pins.HandlesBypass = nil end
-    pcall(handlesBypassWrite, false)
-end
-applyHandlesBypass = function()
-    restoreHandlesBypass()
-    local accum = 0
-    pcall(handlesBypassWrite, true)
-    Pins.HandlesBypass = RunService.Heartbeat:Connect(function(dt)
-        if not Features.HandlesBypass then return end
-        accum = accum + (dt or 0.016)
-        if accum < 0.5 then return end                   -- 2Hz, house cadence for attribute pins
-        accum = 0
-        pcall(handlesBypassWrite, true)
-    end)
-end
-
-
 -- Drive ONE weakpoint part to "big" (a cube at you) or "tiny", writing the static properties ONLY
 -- on the state transition. This is the single biggest write saving in the file: the old version
 -- re-wrote Anchored, CanCollide, CanQuery, CanTouch, Massless, AssemblyLinearVelocity, Size, CFrame,
@@ -2223,124 +1784,6 @@ applyNapeFollow = function()
     end)
 end
 
--- Musket Extender: ranged nape for guns/crossbows. The gun raycasts from the barrel
--- and hits the FIRST queryable part. We KILL the Eye (so it can't steal the hit) and
--- make the Nape a big cube centered on the titan body so any shot at the titan lands
--- on the nape. Confirmed working with muskets 2026-06-22.
-local MUSKET_NAPE_SIZE = 80
-
--- Snapshot once per part so toggling OFF actually puts the titan back. Without this the nape stayed
--- Anchored=true at an 80-stud cube — and anchoring DETACHES it from the rig's welds, so it froze in
--- mid-air, invisible, on every titan we ever touched, until the round ended.
--- Keyed by ADDRESS, not the instance: a shim key misses on every later pass, so the "snapshot once"
--- guard would never trip and from tick 2 on it would record the already-modified 80-stud anchored
--- state as the "original" — re-applying exactly the bug this restore exists to prevent.
-local function musketSnap(part, addr)
-    local k = addr or Reg.addr(part)
-    if not k or Pins.MusketOriginals[k] ~= nil then return end
-    local ok, s = pcall(function()
-        return { part = part, Size = part.Size, Anchored = part.Anchored,
-                 CanCollide = part.CanCollide, Massless = part.Massless,
-                 Transparency = part.Transparency }
-    end)
-    if ok and s then Pins.MusketOriginals[k] = s end
-end
-
--- You cannot shoot what you cannot see. Beyond this there is no reason to hold a nape cube open,
--- and the registry list is distance-sorted so the sweep stops the moment it passes the limit.
-local MUSKET_RANGE = 900
-local MUSKET_MAX   = 12
-
-restoreMusketExtender = function()
-    if Pins.MusketExtender then Pins.MusketExtender:Disconnect(); Pins.MusketExtender = nil end
-    for _, s in pairs(Pins.MusketOriginals) do
-        -- CFrame is deliberately NOT restored: the titan has walked since we snapshotted, and
-        -- un-anchoring lets its own weld put the nape back in the right place.
-        pcall(function()
-            local part = s.part
-            part.Size = s.Size
-            part.Transparency = s.Transparency
-            part.Massless = s.Massless
-            part.CanCollide = s.CanCollide
-            part.Anchored = s.Anchored        -- last, so the weld reclaims it
-        end)
-    end
-    Pins.MusketOriginals = {}
-    for _, e in pairs(Reg.titans) do e.muskNape, e.muskEye = nil, nil end
-end
-applyMusketExtender = function()
-    restoreMusketExtender()
-    Reg.start()
-    local musketAccum, reassert = 0, 0
-    local NAPE_V3 = Vector3.new(MUSKET_NAPE_SIZE, MUSKET_NAPE_SIZE, MUSKET_NAPE_SIZE)
-    local EYE_V3  = Vector3.new(0.05, 0.05, 0.05)
-    Pins.MusketExtender = RunService.Heartbeat:Connect(function(dt)
-        if not Features.MusketExtender then return end
-        musketAccum = musketAccum + (dt or 0.016)
-        if musketAccum < 0.1 then return end        -- 10Hz; the nape only has to track a walking titan
-        musketAccum = 0
-        -- The setup writes below are latched per titan, so if the server ever undoes one the cube
-        -- would silently stop working. Drop the latches every 2s and let them be re-applied — 20x
-        -- cheaper than the old unconditional re-write on every single tick.
-        reassert = reassert + 1
-        if reassert >= 20 then
-            reassert = 0
-            for _, e in pairs(Reg.titans) do e.muskNape, e.muskEye = nil, nil end
-        end
-        -- Everything here reads the registry cache. The old version ran FindFirstChild x3 plus two
-        -- GetAttribute calls on EVERY titan in the server, 15 times a second, with no distance limit
-        -- at all — about 10,000 round-trips/sec during a horde, on its own.
-        local list = Reg.tList
-        local done = 0
-        for i = 1, #list do
-            local e = list[i]
-            if not e.dist or e.dist > MUSKET_RANGE then break end
-            if not e.dead and e.pos then
-                -- Static setup writes happen ONCE per titan, latched on the entry; only the nape's
-                -- CFrame has to be re-written as the titan walks.
-                if e.eye and not e.muskEye then
-                    e.muskEye = true
-                    musketSnap(e.eye, e.eyeAddr)
-                    pcall(function() e.eye.Size = EYE_V3 end)   -- eye can't steal the ranged hit
-                end
-                local nape = e.nape
-                if nape then
-                    if not e.muskNape then
-                        e.muskNape = true
-                        musketSnap(nape, e.napeAddr)
-                        pcall(function() nape.Anchored = true end)
-                        pcall(function() nape.CanCollide = false end)
-                        pcall(function() nape.Massless = true end)
-                        pcall(function() nape.Size = NAPE_V3 end)
-                        pcall(function() nape.Transparency = 1 end)
-                    end
-                    pcall(function() nape.CFrame = CFrame.new(e.pos) end)
-                end
-                done = done + 1
-                if done >= MUSKET_MAX then break end
-            end
-        end
-    end)
-end
-
-restoreNoFallDamage = function()
-    if Pins.NoFallDamage then Pins.NoFallDamage:Disconnect(); Pins.NoFallDamage = nil end
-    pcall(function() local c = LocalPlayer.Character; if c then c:SetAttribute("FallDamageImmune", false) end end)
-end
-applyNoFallDamage = function()
-    restoreNoFallDamage()
-    -- Pin FallDamageImmune=true on our character (~5Hz). CharacterLoader applies fall damage only
-    -- when this attribute is FALSE (the game's own OdmClass sets it true while hooking), so pinning
-    -- it true = no fall damage. One cheap attribute; 5Hz to beat the game's 0.25s reset-to-false.
-    local accum = 0
-    Pins.NoFallDamage = RunService.Heartbeat:Connect(function(dt)
-        accum = accum + (dt or 0.016)
-        if accum < 0.2 then return end
-        accum = 0
-        local c = LocalPlayer.Character
-        if c then pcall(function() c:SetAttribute("FallDamageImmune", true) end) end
-    end)
-end
 restoreCanRollUnlock = function()
     if Pins.CanRoll then Pins.CanRoll:Disconnect(); Pins.CanRoll = nil end
     -- Don't try to flip them back — that would lock you out of working talents
@@ -2419,7 +1862,6 @@ local floor, expf, minf, maxf = math.floor, math.exp, math.min, math.max
 
 -- Foot-to-head span in studs, centred on the HumanoidRootPart. The old code projected pos+(0,3,0)
 -- and pos-(0,3,0) for players and pos+(0,9,0)/pos-(0,9,0) for titans — same 6 and 18 studs.
-local PLAYER_SPAN = 6
 local TITAN_SPAN  = 18
 
 local TITAN_ESP = {
@@ -2485,27 +1927,20 @@ local function mkSquare(z, filled)
     return s
 end
 
-local function makeBundle(isTitan)
+-- Titan-only now; the player half of the ESP was removed, so there is no isTitan branch left.
+local function makeBundle()
     local ok, b = pcall(function()
-        local t = {
+        local c = Drawing.new("Circle")
+        c.Thickness = 2; c.Filled = false; c.NumSides = 14; c.Radius = 5
+        c.Color = TITAN_ESP.NapeColor; c.Visible = false; c.ZIndex = 3
+        return {
             box    = mkSquare(2, false),
             name   = mkText(13, 3),
             hpFill = mkSquare(2, true),
             hpNum  = mkText(12, 3),
+            nape   = c,
+            cache  = {},
         }
-        if isTitan then
-            local c = Drawing.new("Circle")
-            c.Thickness = 2; c.Filled = false; c.NumSides = 14; c.Radius = 5
-            c.Color = TITAN_ESP.NapeColor; c.Visible = false; c.ZIndex = 3
-            t.nape = c
-        else
-            t.dist = mkText(12, 3)
-            local l = Drawing.new("Line")
-            l.Thickness = 1; l.Visible = false; l.ZIndex = 1
-            t.tracer = l
-        end
-        t.cache = {}
-        return t
     end)
     return ok and b or nil
 end
@@ -2534,8 +1969,7 @@ local function setVis(b, el, key, want)
 end
 
 local function freeAll()
-    for _, e in pairs(Reg.titans)  do if e.esp then freeBundle(e.esp); e.esp = nil end end
-    for _, e in pairs(Reg.players) do if e.esp then freeBundle(e.esp); e.esp = nil end end
+    for _, e in pairs(Reg.titans) do if e.esp then freeBundle(e.esp); e.esp = nil end end
 end
 
 -- The registry calls this when a model leaves the world, so its Drawing objects go with it.
@@ -2563,136 +1997,6 @@ local function smoothPos(e, pos, dt)
     return sx, sy, sz
 end
 
--- ---------- players ----------
-
-local function drawPlayer(e, dt, col, colVer)
-    local pos = e.pos
-    if not pos then return false end
-    local dist = e.dist
-    if dist and dist > PLAYER_ESP.MaxDistance then return false end
-
-    local sx, sy, sz = smoothPos(e, pos, dt)
-    local s, on = project(V3(sx, sy, sz))
-    if not (s and on) then return false end
-
-    local b = e.esp
-    if not b then
-        b = makeBundle(false)
-        e.esp = b
-        if not b then return false end
-    end
-    b.cache.hidden = nil
-
-    if b.cache.colVer ~= colVer then
-        b.cache.colVer = colVer
-        b.box.Color = col
-        b.name.Color = col
-        b.dist.Color = col
-        b.tracer.Color = col
-    end
-
-    local d = dist or 100
-    if d < 1 then d = 1 end
-    local boxH = maxf(6, spanPx(PLAYER_SPAN, d, s.X, s.Y))
-    local boxW = boxH * 0.42
-    local cx = s.X
-    local topY = s.Y - boxH * 0.5
-    local bottomY = s.Y + boxH * 0.5
-    local boxX = cx - boxW * 0.5
-
-    if PLAYER_ESP.ShowBox then
-        b.box.Position = rv2(boxX, topY)
-        b.box.Size = rv2(boxW, boxH)
-        setVis(b, b.box, "boxVis", true)
-    else
-        setVis(b, b.box, "boxVis", false)
-    end
-
-    local nameStr = PLAYER_ESP.ShowName and (e.displayName or e.name) or ""
-    if nameStr ~= "" then
-        b.name.Position = rv2(cx, topY - 16)
-        if b.cache.nameTxt ~= nameStr then
-            b.cache.nameTxt = nameStr
-            b.name.Text = nameStr
-        end
-        setVis(b, b.name, "nameVis", true)
-    else
-        setVis(b, b.name, "nameVis", false)
-    end
-
-    local showHp = PLAYER_ESP.ShowHealthBar and e.hpPct ~= nil
-    if showHp then
-        local barW = 3
-        local fillH = boxH * e.hpPct
-        b.hpFill.Position = rv2(boxX - barW - 3, topY + (boxH - fillH))
-        b.hpFill.Size = rv2(barW, fillH)
-        b.hpFill.Color = e.hpColor
-        setVis(b, b.hpFill, "hpFillVis", true)
-    else
-        setVis(b, b.hpFill, "hpFillVis", false)
-    end
-
-    local belowY = bottomY + 1
-    local distInt = (PLAYER_ESP.ShowDistance and dist) and floor(dist + 0.5) or nil
-    if distInt then
-        b.dist.Position = rv2(cx, belowY)
-        if b.cache.distInt ~= distInt then   -- build the string only when the integer changes
-            b.cache.distInt = distInt
-            b.dist.Text = distInt .. "m"
-        end
-        setVis(b, b.dist, "distVis", true)
-        belowY = belowY + 13
-    else
-        setVis(b, b.dist, "distVis", false)
-    end
-
-    if showHp then
-        b.hpNum.Position = rv2(cx, belowY)
-        local hpStr = e.hpStr or "?"
-        if b.cache.hpNumTxt ~= hpStr then
-            b.cache.hpNumTxt = hpStr
-            b.hpNum.Text = hpStr
-        end
-        b.hpNum.Color = e.hpColor
-        setVis(b, b.hpNum, "hpNumVis", true)
-    else
-        setVis(b, b.hpNum, "hpNumVis", false)
-    end
-
-    if PLAYER_ESP.ShowTracer then
-        b.tracer.From = rv2(vpW * 0.5, vpH)
-        b.tracer.To = rv2(cx, bottomY)
-        setVis(b, b.tracer, "tracerVis", true)
-    else
-        setVis(b, b.tracer, "tracerVis", false)
-    end
-    return true
-end
-
-local function espUpdate(dt)
-    local list = Reg.pList
-    if not Features.PlayerESP then
-        for i = 1, #list do
-            local e = list[i]
-            if e.esp then hideBundle(e.esp) end
-        end
-        return
-    end
-    local col = PLAYER_ESP.Color
-    local colVer = PLAYER_ESP._colVer or 0
-    local cap = PLAYER_ESP.MaxRender or 16
-    for i = 1, #list do
-        local e = list[i]
-        -- Reg.pList is distance-sorted, so "index > cap" IS the nearest-N cull. No ranking pass.
-        if i <= cap then
-            local ok, shown = pcall(drawPlayer, e, dt, col, colVer)
-            if not (ok and shown) then if e.esp then hideBundle(e.esp) end end
-        elseif e.esp then
-            hideBundle(e.esp)
-        end
-    end
-end
-
 -- ---------- titans ----------
 
 local function drawTitan(e, dt, rank)
@@ -2708,7 +2012,7 @@ local function drawTitan(e, dt, rank)
 
     local b = e.esp
     if not b then
-        b = makeBundle(true)
+        b = makeBundle()
         e.esp = b
         if not b then return false end
     end
@@ -2841,7 +2145,6 @@ GUI.StartEspLoops = function()
             updView(now)
 
             local t0 = os.clock()
-            pcall(espUpdate, dt)
             pcall(titanEspUpdate, dt)
             local cost = os.clock() - t0
 
@@ -2857,7 +2160,7 @@ GUI.StartEspLoops = function()
             iv = iv + (target - iv) * 0.2
 
             -- Idle cheaply when nothing is being drawn, instead of spinning over two empty lists.
-            task.wait((Features.PlayerESP or Features.TitanESP) and iv or 0.2)
+            task.wait(Features.TitanESP and iv or 0.2)
         end
     end)
 end
@@ -2868,188 +2171,31 @@ end
 -- CONFIG SAVE / LOAD / RESET
 -- ============================================================
 
-saveConfig = function()
-    if type(writefile) ~= "function" then toast("writefile unavailable"); return end
-    local data = {
-        binds = { toggle = GUI.ToggleKey, close = GUI.CloseKey, esp = GUI.ESPKey },
-        horse = { boost = Features.HorseBoost, maxSpeed = Horse.MaxSpeed },
-        esp = {
-            enabled = Features.PlayerESP,
-            r = PLAYER_ESP.ColorR, g = PLAYER_ESP.ColorG, b = PLAYER_ESP.ColorB,
-            maxDistance = PLAYER_ESP.MaxDistance,
-            box = PLAYER_ESP.ShowBox, name = PLAYER_ESP.ShowName, namebg = PLAYER_ESP.ShowNameBg,
-            distance = PLAYER_ESP.ShowDistance, tracer = PLAYER_ESP.ShowTracer,
-            healthbar = PLAYER_ESP.ShowHealthBar,
-            titan = Features.TitanESP, titanNape = Features.TitanNapeMarker,
-        },
-        buffs = {
-            hookRange       = Features.HookRange,
-            gasConservation = Features.GasConservation,
-            reloadSpeed     = Features.ReloadSpeed,
-            odmVeloCap      = Features.OdmVeloCap,
-            runSpeed        = Features.RunSpeed,
-            noGrab          = Features.NoGrab,
-            noStomp         = Features.NoStomp,
-            noBite          = Features.NoBite,
-            napeFollow      = Features.NapeFollow,
-            extendNape      = Features.ExtendNape,
-            extendEye       = Features.ExtendEye,
-            musketExtender  = Features.MusketExtender,
-            napeFollowRange = NapeFollowRange,
-            noAttack        = Features.NoAttack,
-            bladeDura       = Features.BladeDura,
-            canRollUnlock   = Features.CanRollUnlock,
-            noFallDamage    = Features.NoFallDamage,
-            noKick          = Features.NoKick,
-            noPunch         = Features.NoPunch,
-            noSwing         = Features.NoSwing,
-            noAllHitboxes   = Features.NoAllHitboxes,
-            bossScan        = Features.BossScan,
-            titanHPOnly     = Features.TitanHPOnly,
-            titanCap        = Features.TitanCap,
-            autoPin         = Features.AutoPin,
-            autoPinEvery    = AutoPinEvery,
-            handlesBypass   = Features.HandlesBypass,
-            neverStops      = Features.NeverStops,
-            runWithSword    = Features.RunWithSword,
-            veloHUD         = Features.VeloHUD,
-            -- Persist user-entered target values
-            targets = {
-                HookRange          = BuffsState.HookRange.target,
-                GasConservation    = BuffsState.GasConservation.target,
-                ReloadSpeed        = BuffsState.ReloadSpeed.target,
-                OdmVeloCap         = BuffsState.OdmVeloCap.target,
-                RunSpeed           = BuffsState.RunSpeed.target,
-                BladeDura          = BuffsState.BladeDura.target,
-                OdmHookVeloGain    = BuffsState.OdmHookVeloGain.target,
-                OdmPassiveVeloGain = BuffsState.OdmPassiveVeloGain.target,
-                ActionSpeed        = BuffsState.ActionSpeed.target,
-                FirearmRange       = BuffsState.FirearmRange.target,
-            },
-        },
-    }
-    pcall(function()
-        if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
-            makefolder(CONFIG_DIR)
-        end
-        writefile(CONFIG_PATH, HttpService:JSONEncode(data))
-    end)
-end
-
-loadConfig = function()
-    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
-    if not isfile(CONFIG_PATH) then return end
-    local ok, raw = pcall(readfile, CONFIG_PATH)
-    if not (ok and raw) then return end
-    local okJ, data = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not (okJ and type(data) == "table") then return end
-    if type(data.binds) == "table" then
-        if type(data.binds.toggle) == "number" then GUI.ToggleKey = data.binds.toggle end
-        if type(data.binds.close)  == "number" then GUI.CloseKey  = data.binds.close  end
-        if type(data.binds.esp)    == "number" then GUI.ESPKey    = data.binds.esp    end
-    end
-    if type(data.horse) == "table" then
-        if type(data.horse.boost)     == "boolean" then Features.HorseBoost = data.horse.boost end
-        -- clamp to the slider's domain: a hand-edited config shouldn't be able to set values the UI
-        -- can't produce (NapeFollowRange in particular sizes a per-titan cube)
-        if type(data.horse.maxSpeed)  == "number"  then Horse.MaxSpeed = math.max(65, math.min(data.horse.maxSpeed, 145)) end
-    end
-    if type(data.esp) == "table" then
-        local e = data.esp
-        if type(e.enabled)     == "boolean" then Features.PlayerESP       = e.enabled end
-        if type(e.titan)       == "boolean" then Features.TitanESP         = e.titan end
-        if type(e.titanNape)   == "boolean" then Features.TitanNapeMarker  = e.titanNape end
-        if type(e.r)           == "number"  then PLAYER_ESP.ColorR        = e.r end
-        if type(e.g)           == "number"  then PLAYER_ESP.ColorG        = e.g end
-        if type(e.b)           == "number"  then PLAYER_ESP.ColorB        = e.b end
-        if type(e.maxDistance) == "number"  then PLAYER_ESP.MaxDistance   = math.max(0, math.min(e.maxDistance, 100000)) end
-        if type(e.box)         == "boolean" then PLAYER_ESP.ShowBox       = e.box end
-        if type(e.name)        == "boolean" then PLAYER_ESP.ShowName      = e.name end
-        if type(e.namebg)      == "boolean" then PLAYER_ESP.ShowNameBg    = e.namebg end
-        if type(e.distance)    == "boolean" then PLAYER_ESP.ShowDistance  = e.distance end
-        if type(e.tracer)      == "boolean" then PLAYER_ESP.ShowTracer    = e.tracer end
-        if type(e.healthbar)   == "boolean" then PLAYER_ESP.ShowHealthBar = e.healthbar end
-        espRecolor()
-    end
-    if type(data.buffs) == "table" then
-        local b = data.buffs
-        if type(b.hookRange)       == "boolean" then Features.HookRange       = b.hookRange end
-        if type(b.gasConservation) == "boolean" then Features.GasConservation = b.gasConservation end
-        if type(b.reloadSpeed)     == "boolean" then Features.ReloadSpeed     = b.reloadSpeed end
-        if type(b.odmVeloCap)      == "boolean" then Features.OdmVeloCap      = b.odmVeloCap end
-        if type(b.runSpeed)        == "boolean" then Features.RunSpeed        = b.runSpeed end
-        if type(b.noGrab)          == "boolean" then Features.NoGrab          = b.noGrab end
-        if type(b.noStomp)         == "boolean" then Features.NoStomp         = b.noStomp end
-        if type(b.noBite)          == "boolean" then Features.NoBite          = b.noBite end
-        if type(b.napeFollow)      == "boolean" then Features.NapeFollow      = b.napeFollow end
-        if type(b.extendNape)      == "boolean" then Features.ExtendNape      = b.extendNape end
-        if type(b.extendEye)       == "boolean" then Features.ExtendEye       = b.extendEye end
-        if type(b.musketExtender)  == "boolean" then Features.MusketExtender  = b.musketExtender end
-        if type(b.napeFollowRange) == "number"  then NapeFollowRange          = math.max(30, math.min(b.napeFollowRange, 900)) end
-        if type(b.noAttack)        == "boolean" then Features.NoAttack        = b.noAttack end
-        if type(b.bladeDura)       == "boolean" then Features.BladeDura       = b.bladeDura end
-        if type(b.canRollUnlock)   == "boolean" then Features.CanRollUnlock   = b.canRollUnlock end
-        if type(b.noFallDamage)    == "boolean" then Features.NoFallDamage    = b.noFallDamage end
-        if type(b.noKick)          == "boolean" then Features.NoKick          = b.noKick end
-        if type(b.noPunch)         == "boolean" then Features.NoPunch         = b.noPunch end
-        if type(b.noSwing)         == "boolean" then Features.NoSwing         = b.noSwing end
-        if type(b.noAllHitboxes)   == "boolean" then Features.NoAllHitboxes   = b.noAllHitboxes end
-        if type(b.bossScan)        == "boolean" then Features.BossScan        = b.bossScan end
-        if type(b.titanHPOnly)     == "boolean" then Features.TitanHPOnly     = b.titanHPOnly end
-        if type(b.titanCap)        == "boolean" then Features.TitanCap        = b.titanCap end
-        if type(b.autoPin)         == "boolean" then Features.AutoPin         = b.autoPin end
-        if type(b.handlesBypass)   == "boolean" then Features.HandlesBypass   = b.handlesBypass end
-        if type(b.neverStops)      == "boolean" then Features.NeverStops      = b.neverStops end
-        if type(b.runWithSword)    == "boolean" then Features.RunWithSword    = b.runWithSword end
-        if type(b.veloHUD)         == "boolean" then Features.VeloHUD         = b.veloHUD end
-        if type(b.autoPinEvery)    == "number"  and b.autoPinEvery > 0 then
-            -- clamp BOTH ends to the slider's 1..30 domain: a hand-edited config with 0.01 would
-            -- otherwise pass the accumulator gate every frame and re-pin 9 attributes per frame
-            AutoPinEvery = math.max(1, math.min(b.autoPinEvery, 30))
-        end
-        if type(b.targets) == "table" then
-            for k, v in pairs(b.targets) do
-                if BuffsState[k] and type(v) == "number" and v > 0 then
-                    BuffsState[k].target = math.min(v, BuffsState[k].max or 100000)
-                end
-            end
-        end
-    end
-end
-
 resetConfig = function()
-    GUI.ToggleKey = 0x72; GUI.CloseKey = 0x23; GUI.ESPKey = 0x73
-    Features.HorseBoost = false; Features.PlayerESP = false; Features.SprintSpeed = false
+    GUI.ToggleKey = 0x72; GUI.CloseKey = 0x23
+    Features.HorseBoost = false
     Features.TitanESP = false; Features.TitanNapeMarker = true
     Features.HookRange = false; Features.GasConservation = false; Features.CanRollUnlock = false
-    Features.NoFallDamage = false
     Features.ReloadSpeed = false; Features.OdmVeloCap = false; Features.RunSpeed = false
     Features.NoGrab = false; Features.NoStomp = false; Features.NoBite = false
     Features.NoKick = false; Features.NoPunch = false; Features.NoSwing = false
     Features.NoAllHitboxes = false; Features.BossScan = true
     Features.TitanHPOnly = false; Features.TitanCap = false
-    Features.AutoPin = false; Features.HandlesBypass = false
-    Features.NeverStops = false; Features.RunWithSword = false; Features.VeloHUD = false
+    Features.AutoPin = false
+    Features.VeloHUD = false
     AutoPinEvery = 3
     Features.NapeFollow = false
     Features.ExtendNape = true
     Features.ExtendEye = true
-    Features.MusketExtender = false
     Features.NoAttack = false
     Features.BladeDura = false
     NapeFollowRange = 60
-    restoreHookRange(); restoreGasConservation(); restoreCanRollUnlock()
-    restoreNoFallDamage()
-    restoreReloadSpeed(); restoreOdmVeloCap(); restoreRunSpeed()
+    restoreCanRollUnlock()
     refreshAntiTitan()
     restoreNapeFollow()
-    restoreMusketExtender()
     restoreNoAttack()
     restoreBladeDura()
     pcall(restoreAutoPin)
-    pcall(restoreHandlesBypass)
-    pcall(restoreNeverStops)
-    pcall(restoreRunWithSword)
     pcall(restoreVeloHUD)
     -- Reset target values to recommended natural-feel defaults
     BuffsState.HookRange.target          = 15
@@ -3062,15 +2208,10 @@ resetConfig = function()
     BuffsState.OdmPassiveVeloGain.target = 10
     BuffsState.ActionSpeed.target        = 2
     BuffsState.FirearmRange.target       = 100
+    pcall(restoreHorseWatch)
     if Horse.SnapTaken then restoreHorse() end
     Horse.MaxSpeed = 65
-    Sprint.Speed = 38
-    PLAYER_ESP.ColorR, PLAYER_ESP.ColorG, PLAYER_ESP.ColorB = 255, 255, 255
-    PLAYER_ESP.MaxDistance = 100000
-    PLAYER_ESP.ShowBox, PLAYER_ESP.ShowName, PLAYER_ESP.ShowDistance, PLAYER_ESP.ShowTracer = true, true, true, false
-    PLAYER_ESP.ShowNameBg = true
-    PLAYER_ESP.ShowHealthBar = true
-    espRecolor()
+    VELO.x, VELO.y = nil, nil     -- back to the default screen position
 end
 
 -- ============================================================
@@ -3083,17 +2224,14 @@ local function UnloadScript()
     -- Corpse ESP labels are Drawing objects; clearing GUI.Running only stops the loop, it does not
     -- remove them, so they would hang on screen after unload. Called through GUI because the corpse
     -- engine is declared further down the file than this function.
+    pcall(function() if GUI.CorpseFlushWebhook then GUI.CorpseFlushWebhook() end end)
     pcall(function() if GUI.CorpseCleanup then GUI.CorpseCleanup() end end)
     -- Tear down the INS-ui window (cleanup closure is installed at startup)
     pcall(function() if _G.MatchaCleanup then _G.MatchaCleanup() end end)
     _G.MatchaCleanup = nil
+    pcall(restoreHorseWatch)
     if Horse.SnapTaken then pcall(restoreHorse) end
     -- Tear down buff Heartbeat pins
-    pcall(restoreHookRange)
-    pcall(restoreGasConservation)
-    pcall(restoreReloadSpeed)
-    pcall(restoreOdmVeloCap)
-    pcall(restoreRunSpeed)
     -- Tear down anti-titan: force all flags off, clear titan attributes, stop the pin.
     -- ALL hitbox flags must be cleared before refreshAntiTitan, or anyTitanFeatureOn() stays true
     -- and the "restore" pass re-ENABLES the 3Hz loop + ChildAdded hook instead of tearing them down.
@@ -3102,27 +2240,15 @@ local function UnloadScript()
     Features.NoAllHitboxes = false
     pcall(refreshAntiTitan)
     pcall(restoreNapeFollow)
-    pcall(restoreMusketExtender)
     pcall(restoreNoAttack)
     pcall(restoreBladeDura)
     pcall(restoreCanRollUnlock)
-    pcall(restoreNoFallDamage)
     pcall(restoreAutoPin)
-    pcall(restoreHandlesBypass)
-    pcall(restoreNeverStops)
-    pcall(restoreRunWithSword)
     pcall(restoreVeloHUD)
-    for _, el in ipairs(GUI.Elements)        do pcall(function() el:Remove() end) end
-    for _, el in ipairs(GUI.ContentElements) do pcall(function() el:Remove() end) end
-    for _, el in ipairs(GUI.SubTabElements)  do pcall(function() el:Remove() end) end
-    for _, el in ipairs(GUI.RSDiffElements)  do pcall(function() el:Remove() end) end
-    for _, el in ipairs(GUI.EnchantsElements) do pcall(function() el:Remove() end) end
-    GUI.Elements, GUI.ContentElements, GUI.SubTabElements, GUI.RSDiffElements, GUI.EnchantsElements = {}, {}, {}, {}, {}
-    GUI.Clickables, GUI.SubTabClickables, GUI.RSDiffClickables, GUI.EnchantsClickables = {}, {}, {}, {}
     -- Drop the world cache too, so a re-run starts from a clean tree (GUI.Running = false above has
     -- already stopped the registry loop).
-    Reg.titans, Reg.tList, Reg.players, Reg.pList = {}, {}, {}, {}
-    Reg.tFolder, Reg.pFolder = nil, nil
+    Reg.titans, Reg.tList = {}, {}
+    Reg.tFolder = nil
     _G.VERFALL = nil
 end
 
@@ -3198,11 +2324,10 @@ if type(Lib) ~= "table" then
     return
 end
 
--- Startup loadConfig removed alongside the Save/Load buttons: with nothing writing Verfall/config.json
--- any more, auto-loading it would pin you to a stale snapshot with no way to update it. The library's
--- autoload owns startup state now. (saveConfig/loadConfig are kept below — resetConfig shares their
--- default tables, and they remain the migration path for an existing config.json.)
-espRecolor()
+-- Config persistence is the UI library's named-config manager (Settings tab). The old hand-rolled
+-- saveConfig/loadConfig pair was deleted: nothing called either of them, so they were writing and
+-- reading a file no code path ever consulted. resetConfig stays — it resets in-script values the
+-- library cannot reach.
 if GUI.StartEspLoops then GUI.StartEspLoops() end
 
 -- Theme: yellow accent by default (changeable in Settings -> Theme).
@@ -3838,6 +2963,13 @@ function CORPSE.hideAll()
 end
 
 -- Called by UnloadScript (which is defined ABOVE this block, so it reaches us through GUI).
+-- Flush a webhook edit that has not hit its debounce yet. UnloadScript sets GUI.Running = false,
+-- which stops the loop that would otherwise do the write, so without this an edit made in the last
+-- 1.5s before unload is silently lost and next launch looks like the setting never took.
+function GUI.CorpseFlushWebhook()
+    if CORPSE.saveAt then CORPSE.saveAt = nil; CORPSE.saveWebhook() end
+end
+
 function GUI.CorpseCleanup()
     for key, e in pairs(CORPSE.entries) do
         if e.bundle and e.bundle.name then pcall(function() e.bundle.name:Remove() end) end
@@ -3902,26 +3034,15 @@ local tabMain = window:Tab("Main", "home")
 local secHorse = tabMain:Section("Horse", "Left", "Mount Tweaks")
 secHorse:Toggle("Infinite Stamina", Features.HorseBoost, function(v)
     Features.HorseBoost = v
-    if v then applyHorseBoost() else restoreHorse() end
-end)
-secHorse:Toggle("Never Stops", Features.NeverStops, function(v)
-    Features.NeverStops = v
-    if v then applyNeverStops() else restoreNeverStops() end
-end):Tooltip("re-pin the horse's speed and shove it back up to pace when it stalls (10Hz)")
+    if v then applyHorseBoost(); applyHorseWatch()
+    else restoreHorseWatch(); restoreHorse() end
+end):Tooltip("re-pins itself when you despawn and re-summon the horse")
 secHorse:Slider("Max Speed", Horse.MaxSpeed, 1, 65, 145, "", function(v)
     Horse.MaxSpeed = v
     if Features.HorseBoost then applyHorseBoost() end
 end)
 
-local secVis = tabMain:Section("Visuals", "Right", "Player + Titan ESP")
-secVis:Toggle("Player ESP", Features.PlayerESP, function(v) Features.PlayerESP = v end)
-    :AddKeybind("f4", "Toggle")
-    :AddColorpicker("ESP Color", PLAYER_ESP.Color, function(c)
-        PLAYER_ESP.ColorR = math.floor(c.R * 255 + 0.5)
-        PLAYER_ESP.ColorG = math.floor(c.G * 255 + 0.5)
-        PLAYER_ESP.ColorB = math.floor(c.B * 255 + 0.5)
-        pcall(espRecolor)
-    end)
+local secVis = tabMain:Section("Visuals", "Right", "Titan ESP")
 secVis:Toggle("Titan ESP", Features.TitanESP, function(v) Features.TitanESP = v end)
 secVis:Toggle("Nape Marker", Features.TitanNapeMarker, function(v) Features.TitanNapeMarker = v end)
 secVis:Toggle("Nape HP Only", Features.TitanHPOnly, function(v) Features.TitanHPOnly = v end)
@@ -3934,15 +3055,7 @@ secVis:Toggle("Cap (horde perf)", Features.TitanCap, function(v) Features.TitanC
 secVis:Toggle("Velo HUD", Features.VeloHUD, function(v)
     Features.VeloHUD = v
     if v then applyVeloHUD() else restoreVeloHUD() end
-end):Tooltip("bottom-centre live ODM velocity + peak")
-secVis:Slider("Max Distance", PLAYER_ESP.MaxDistance, 50, 0, 100000, "", function(v) PLAYER_ESP.MaxDistance = v end)
-
-local secEls = tabMain:Section("ESP Elements", "Right", "What To Draw")
-secEls:Toggle("Box", PLAYER_ESP.ShowBox, function(v) PLAYER_ESP.ShowBox = v end)
-secEls:Toggle("Name", PLAYER_ESP.ShowName, function(v) PLAYER_ESP.ShowName = v end)
-secEls:Toggle("Distance", PLAYER_ESP.ShowDistance, function(v) PLAYER_ESP.ShowDistance = v end)
-secEls:Toggle("Tracer", PLAYER_ESP.ShowTracer, function(v) PLAYER_ESP.ShowTracer = v end)
-secEls:Toggle("Health Bar", PLAYER_ESP.ShowHealthBar, function(v) PLAYER_ESP.ShowHealthBar = v end)
+end):Tooltip("plain [ 185 ] velocity readout - drag it anywhere while the menu is open")
 
 end  -- /Main tab
 -- ===== Tab: Character =====
@@ -4063,25 +3176,7 @@ secTitan:Toggle("Hitbox Expander", Features.NapeFollow, function(v)
 end):Tooltip("extend the nape/eye weakpoints toward you (swords)")
 secTitan:Toggle("Extend Nape", Features.ExtendNape, function(v) Features.ExtendNape = v end)
 secTitan:Toggle("Extend Eyes", Features.ExtendEye, function(v) Features.ExtendEye = v end)
-secTitan:Toggle("Musket Extender", Features.MusketExtender, function(v)
-    Features.MusketExtender = v
-    if v then applyMusketExtender() else restoreMusketExtender() end
-end):Tooltip("ranged nape envelop (musket/crossbow)")
 secTitan:Slider("Range", NapeFollowRange, 1, 30, 900, "", function(v) NapeFollowRange = v end)
-
-local secUtil = tabChar:Section("Utility", "Right", "Character")
-secUtil:Toggle("No Fall Damage", Features.NoFallDamage, function(v)
-    Features.NoFallDamage = v
-    if v then applyNoFallDamage() else restoreNoFallDamage() end
-end):Tooltip("pin FallDamageImmune=true — stop taking fall damage (client-side)")
-secUtil:Toggle("Handles Bypass", Features.HandlesBypass, function(v)
-    Features.HandlesBypass = v
-    if v then applyHandlesBypass() else restoreHandlesBypass() end
-end):Tooltip("use weapons without the handles requirement (Tools only, re-pinned 2Hz)")
-secUtil:Toggle("Running With Sword", Features.RunWithSword, function(v)
-    Features.RunWithSword = v
-    if v then applyRunWithSword() else restoreRunWithSword() end
-end):Tooltip("keep full run speed through a swing (pins DisableDirectionalMovement=false, 5Hz)")
 
 end  -- /Character tab
 -- ===== Tab: Tools (wrench) — opens the smooth Requiem-UI RS Diff panel =====
@@ -4132,10 +3227,6 @@ secCorpse:Toggle("Webhook Log", CORPSE.Log, function(v)
         end
     end
 end):Tooltip("post each NEW corpse to the Discord webhook once. Bodies already on the ground when you enable this are recorded, not posted")
-secCorpse:Slider("ESP Distance", CORPSE.MaxDist, 100, 100, 100000, "", function(v)
-    CORPSE.MaxDist = tonumber(v) or CORPSE.MaxDist
-end)
-
 secCorpse:Button("Queue All Corpses", function()
     task.spawn(function()
         local n = CORPSE.fetchAll()
@@ -4150,6 +3241,12 @@ local whBox = secWH:Textbox("Webhook URL", CORPSE.Webhook, function(s)
     CORPSE.lastError = nil                  -- a new URL clears a stale "Unknown Webhook"
     CORPSE.saveAt    = os.clock() + 1.5     -- debounce; the loop does the actual write
 end):Tooltip("paste your Discord webhook URL here - it is saved to Verfall/webhook.txt automatically")
+-- ⚠ KEEP THE LIBRARY CONFIG MANAGER OUT OF THIS BOX. Its serialiser stores every control with a
+-- value, and its autoload restores them by CALLING THE SETTER, which fires our callback. A config
+-- saved while an older URL was in the box would therefore overwrite the current one AND, via the
+-- debounce, write that stale URL back over webhook.txt - destroying the good webhook on disk. The
+-- library sets noSave on its own config controls for exactly this reason. webhook.txt owns the URL.
+pcall(function() whBox.item.noSave = true end)
 
 local function whSet(url)
     CORPSE.Webhook   = (tostring(url or ""):gsub("%s+", ""))
@@ -4286,22 +3383,17 @@ secScript:Button("Unload", function() pcall(UnloadScript) end):SetRisk()
 
 end  -- /Settings tab
 -- Re-apply persisted feature state (config auto-loads above).
-if Features.HorseBoost then pcall(applyHorseBoost) end
+if Features.HorseBoost then pcall(applyHorseBoost); pcall(applyHorseWatch) end
 -- anyTitanFeatureOn() rather than an inline list, so this can never drift again when a new hitbox
 -- toggle is added (a persisted "No Kick" used to show ON at startup and do nothing).
 if anyTitanFeatureOn() then pcall(refreshAntiTitan) end
 if Features.NapeFollow then pcall(applyNapeFollow) end
-if Features.MusketExtender then pcall(applyMusketExtender) end
 if Features.NoAttack then pcall(applyNoAttack) end
 if Features.CanRollUnlock then pcall(applyCanRollUnlock) end
-if Features.NoFallDamage then pcall(applyNoFallDamage) end
 if Features.AutoPin then pcall(applyAutoPin) end
-if Features.HandlesBypass then pcall(applyHandlesBypass) end
-if Features.NeverStops then pcall(applyNeverStops) end
-if Features.RunWithSword then pcall(applyRunWithSword) end
 if Features.VeloHUD then pcall(applyVeloHUD) end
 
--- End key = full unload (the library owns F3 menu-toggle + F4 ESP).
+-- End key = full unload (the library owns the F3 menu toggle).
 -- RELEASE-ARM GUARD (mirrors Menu.lua's CloseKeyReady): only unload AFTER the close key has
 -- been observed RELEASED at least once. Matcha can falsely report VK_END (0x23) as permanently
 -- held (an iskeypressed quirk — confirmed 2026-07-02: iskeypressed(0x23) returns true even when
