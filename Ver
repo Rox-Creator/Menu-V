@@ -183,6 +183,13 @@ local Features = {
     NoKick         = false,  -- disable the Kick hitbox
     NoPunch        = false,  -- shifter/Ogre: Punch1/2/3 + HeavyAttack
     NoSwing        = false,  -- shifter/Ogre: *Swing* + *Eat (Bite stays under No Bite)
+    -- Staff-spawned bosses (2026-08-16). Live-verified on game.Workspace.Ogre: a shifter parented
+    -- at the WORKSPACE ROOT, not in World.Titans, so the registry never saw it and every toggle
+    -- above silently skipped it. Its Hitboxes folder is LeftSwing/LeftStomp/RightSwing/RightStomp
+    -- with NO Grab, Punch, Bite or Kick and NO Detectors folder — so name-matching per move is a
+    -- poor fit for these. NoAllHitboxes is the reliable switch for them.
+    BossScan       = true,   -- also register top-level Workspace models that carry a Hitboxes folder
+    NoAllHitboxes  = false,  -- disable EVERY hitbox part regardless of its name
     TitanCap       = false,  -- horde perf: only draw the closest N titans in the ESP
     AutoPin        = false,  -- re-pin every ClientInformation buff on a slow timer
     HandlesBypass  = false,  -- pin HandlesBypass/ProtoHandlesBypass on your Tools
@@ -1249,6 +1256,9 @@ local TITAN_TINY = Vector3.new(0.01, 0.01, 0.01)
 -- `lname` is the pre-lowered part name cached by the registry at resolve time. Passing it keeps this
 -- off the bridge entirely: the old caller read part.Name on EVERY pass of EVERY titan.
 local function shouldDisableHitbox(lname)
+    -- Master switch, checked first: kill EVERY hitbox part whatever it is called. Staff bosses use
+    -- move names the per-move toggles below don't know about, so this is the one that works on them.
+    if Features.NoAllHitboxes then return true end
     if (lname == "leftgrab" or lname == "rightgrab") and Features.NoGrab then return true end
     if (lname == "leftstomp" or lname == "rightstomp") and Features.NoStomp then return true end
     if lname == "bite" and Features.NoBite then return true end
@@ -1271,7 +1281,7 @@ end
 
 local function anyTitanFeatureOn()
     return Features.NoGrab or Features.NoStomp or Features.NoBite or Features.NoAttack
-        or Features.NoKick or Features.NoPunch or Features.NoSwing
+        or Features.NoKick or Features.NoPunch or Features.NoSwing or Features.NoAllHitboxes
 end
 
 -- ============================================================
@@ -1348,6 +1358,17 @@ Reg.resolveTitan = function(e)
             if e.eye then e.eyeAddr = Reg.addr(e.eye) end
         end
     end
+    -- Staff bosses/shifters ship NO DamagePoints folder: Nape sits at the model root and the eyes
+    -- are LeftEyeHitbox / RightEyeHitbox beside it (live-verified on Workspace.Ogre 2026-08-16).
+    -- Without this fallback the expander/musket features can never find a boss's weakpoints.
+    if not e.nape then
+        e.nape = m:FindFirstChild("Nape")
+        if e.nape then e.napeAddr = Reg.addr(e.nape) end
+    end
+    if not e.eye then
+        e.eye = m:FindFirstChild("LeftEyeHitbox") or m:FindFirstChild("RightEyeHitbox")
+        if e.eye then e.eyeAddr = Reg.addr(e.eye) end
+    end
     if not e.hitboxes then
         local hb = m:FindFirstChild("Hitboxes")
         if hb then
@@ -1375,7 +1396,9 @@ Reg.resolveTitan = function(e)
     -- DamagePoints/Hitboxes parent a frame or more after the model, so keep retrying for a while
     -- before giving up — a titan we mark resolved without a Hitboxes list can never be disabled.
     -- Retries are bounded by the per-tick budget in Reg.tick, so a mass spawn can't burst.
-    e.resolved = (e.hrp ~= nil and e.hitboxes ~= nil and e.dp ~= nil) or e.tries >= 20
+    -- `e.nape ~= nil` satisfies the weakpoint half for bosses, which have no DamagePoints folder —
+    -- otherwise every boss burned all 20 retries before being force-resolved.
+    e.resolved = (e.hrp ~= nil and e.hitboxes ~= nil and (e.dp ~= nil or e.nape ~= nil)) or e.tries >= 20
 end
 
 Reg.samplePos = function(e, myPos)
@@ -1431,27 +1454,72 @@ Reg.dropTitan = function(a, e)
     Reg.titans[a] = nil
 end
 
+-- STAFF BOSSES. Shifters (Ogre, Abnormal, ...) are parented at the WORKSPACE ROOT rather than in
+-- World.Titans, so the folder scan alone can never see them — which is exactly why none of the
+-- anti-hitbox toggles did anything to them. Identify by SHAPE, not by name, so a boss we've never
+-- heard of still registers: a top-level Model carrying a Hitboxes folder.
+-- Throttled to BOSS_EVERY seconds because Workspace has a lot of direct children and each one is a
+-- bridge read; between scans the cached set is replayed into `seen` so bosses aren't dropped.
+Reg.bossAt    = 0
+Reg.bossSeen  = {}
+Reg.BOSS_EVERY = 5
+
+Reg.scanBosses = function(store, seen)
+    if not Features.BossScan then Reg.bossSeen = {}; return end
+    local nowc = os.clock()
+    if nowc < Reg.bossAt then
+        for a in pairs(Reg.bossSeen) do seen[a] = true end
+        return
+    end
+    Reg.bossAt = nowc + Reg.BOSS_EVERY
+    local kids; local ok = pcall(function() kids = Workspace:GetChildren() end)
+    if not ok or type(kids) ~= "table" then
+        for a in pairs(Reg.bossSeen) do seen[a] = true end
+        return
+    end
+    local found = {}
+    for i = 1, #kids do
+        local m = kids[i]
+        local cls; pcall(function() cls = m.ClassName end)
+        if cls == "Model" then
+            local hb; pcall(function() hb = m:FindFirstChild("Hitboxes") end)
+            if hb then
+                local a = Reg.addr(m)
+                if a then
+                    found[a] = true
+                    seen[a]  = true
+                    local e = store[a]
+                    if not e then store[a] = { addr = a, model = m, boss = true }
+                    else e.model = m; e.boss = true end
+                end
+            end
+        end
+    end
+    Reg.bossSeen = found
+end
+
 Reg.rescanTitans = function()
     Reg.tFolder = Reg.folder(Reg.tFolder, "Titans")
     local f = Reg.tFolder
     local store = Reg.titans
-    if not f then
-        for a, e in pairs(store) do Reg.dropTitan(a, e) end
-        Reg.tList = {}
-        return
-    end
-    local kids; local ok = pcall(function() kids = f:GetChildren() end)
-    if not ok or type(kids) ~= "table" then return end
     local seen = {}
-    for i = 1, #kids do
-        local m = kids[i]
-        local a = Reg.addr(m)
-        if a then
-            seen[a] = true
-            local e = store[a]
-            if not e then store[a] = { addr = a, model = m } else e.model = m end
+    -- The Titans folder may be absent (lobby, or a staff boss spawned outside a round) but a boss
+    -- can still be live, so this no longer early-returns and wipes the store.
+    if f then
+        local kids; local ok = pcall(function() kids = f:GetChildren() end)
+        if ok and type(kids) == "table" then
+            for i = 1, #kids do
+                local m = kids[i]
+                local a = Reg.addr(m)
+                if a then
+                    seen[a] = true
+                    local e = store[a]
+                    if not e then store[a] = { addr = a, model = m } else e.model = m end
+                end
+            end
         end
     end
+    Reg.scanBosses(store, seen)
     for a, e in pairs(store) do
         if not seen[a] then Reg.dropTitan(a, e) end
     end
@@ -1511,7 +1579,7 @@ end
 Reg.wantTitans = function()
     return Features.TitanESP or Features.NapeFollow or Features.MusketExtender
         or Features.NoGrab or Features.NoStomp or Features.NoBite or Features.NoAttack
-        or Features.NoKick or Features.NoPunch or Features.NoSwing
+        or Features.NoKick or Features.NoPunch or Features.NoSwing or Features.NoAllHitboxes
 end
 
 -- Round-robin a cold slice of `list` (everything past `hot`) through `fn`.
@@ -2835,6 +2903,8 @@ saveConfig = function()
             noKick          = Features.NoKick,
             noPunch         = Features.NoPunch,
             noSwing         = Features.NoSwing,
+            noAllHitboxes   = Features.NoAllHitboxes,
+            bossScan        = Features.BossScan,
             titanHPOnly     = Features.TitanHPOnly,
             titanCap        = Features.TitanCap,
             autoPin         = Features.AutoPin,
@@ -2923,6 +2993,8 @@ loadConfig = function()
         if type(b.noKick)          == "boolean" then Features.NoKick          = b.noKick end
         if type(b.noPunch)         == "boolean" then Features.NoPunch         = b.noPunch end
         if type(b.noSwing)         == "boolean" then Features.NoSwing         = b.noSwing end
+        if type(b.noAllHitboxes)   == "boolean" then Features.NoAllHitboxes   = b.noAllHitboxes end
+        if type(b.bossScan)        == "boolean" then Features.BossScan        = b.bossScan end
         if type(b.titanHPOnly)     == "boolean" then Features.TitanHPOnly     = b.titanHPOnly end
         if type(b.titanCap)        == "boolean" then Features.TitanCap        = b.titanCap end
         if type(b.autoPin)         == "boolean" then Features.AutoPin         = b.autoPin end
@@ -2954,6 +3026,7 @@ resetConfig = function()
     Features.ReloadSpeed = false; Features.OdmVeloCap = false; Features.RunSpeed = false
     Features.NoGrab = false; Features.NoStomp = false; Features.NoBite = false
     Features.NoKick = false; Features.NoPunch = false; Features.NoSwing = false
+    Features.NoAllHitboxes = false; Features.BossScan = true
     Features.TitanHPOnly = false; Features.TitanCap = false
     Features.AutoPin = false; Features.HandlesBypass = false
     Features.NeverStops = false; Features.RunWithSword = false; Features.VeloHUD = false
@@ -3007,6 +3080,10 @@ end
 local function UnloadScript()
     GUI.Running = false
     pcall(function() if GUI.StopEspLoops then GUI.StopEspLoops() end end)
+    -- Corpse ESP labels are Drawing objects; clearing GUI.Running only stops the loop, it does not
+    -- remove them, so they would hang on screen after unload. Called through GUI because the corpse
+    -- engine is declared further down the file than this function.
+    pcall(function() if GUI.CorpseCleanup then GUI.CorpseCleanup() end end)
     -- Tear down the INS-ui window (cleanup closure is installed at startup)
     pcall(function() if _G.MatchaCleanup then _G.MatchaCleanup() end end)
     _G.MatchaCleanup = nil
@@ -3022,6 +3099,7 @@ local function UnloadScript()
     -- and the "restore" pass re-ENABLES the 3Hz loop + ChildAdded hook instead of tearing them down.
     Features.NoGrab = false; Features.NoStomp = false; Features.NoBite = false; Features.NoAttack = false
     Features.NoKick = false; Features.NoPunch = false; Features.NoSwing = false
+    Features.NoAllHitboxes = false
     pcall(refreshAntiTitan)
     pcall(restoreNapeFollow)
     pcall(restoreMusketExtender)
@@ -3163,6 +3241,313 @@ task.spawn(function()
     while GUI.Running do
         task.wait(1)
         pcall(function() Lib:SetAutoSave(false) end)
+    end
+end)
+
+-- ============================================================
+-- CORPSE LOG — ESP over Workspace.World.Corpses + a Discord webhook
+-- ============================================================
+-- Corpses carry everything we want as ATTRIBUTES: LoreName, PlayerName and an Inventory JSON blob.
+--
+-- ⚠ Matcha's GetAttribute TRUNCATES strings at 255 characters. Live-measured on two different
+-- corpses: both came back at exactly 255 with an unbalanced brace count (7 open / 6 close), i.e.
+-- cut mid-object. There is no second copy of the data on the model, and the value string is not
+-- reachable by a shallow pointer walk off the instance (I scanned three hops; the only long JSON
+-- found that way is Roblox's own policy-service blob, which is a global and identical on every
+-- corpse). So the item list can be SHORT on a well-stocked corpse. The parser below stops cleanly
+-- at the cut instead of emitting a mangled entry, and the webhook says so when it happens.
+--
+-- Everything here is READ-ONLY plus one HTTP POST. Nothing is written to the game.
+local CORPSE = {
+    ESP        = false,        -- draw name/username over corpses
+    Log        = false,        -- POST new corpses to the webhook
+    Webhook    = "https://discord.com/api/webhooks/1538808588343058593/HpfS6OmXiRgaNZoxgQxiso5gBXCj6Wz8GQwEHsBc5eBUSa9ETwXSLUY9Yr-wBOb_hee4",
+    MaxDist    = 100000,
+    entries    = {},           -- [key] = { model, part, lore, user, items, truncated, pos, dist, bundle }
+    seen       = {},           -- [key] = true, so each corpse is posted at most once
+    seeded     = false,        -- first scan only records; it never floods the channel on enable
+    sent       = 0,
+    tracked    = 0,
+    status     = "idle",
+}
+
+-- Tolerant JSON-ish scanner for the Inventory blob.
+--   {"Bandage":{"Amount":5,"HotbarSlot":2,"Metadata":[]},"Flint":{...},...}
+-- We only want the item name and its Amount. A truncated tail is expected (see above), so this
+-- walks value-by-value and BAILS the moment a value doesn't close, rather than regex-scraping
+-- "Amount" globally — which would happily pair the last complete Amount with a half-read name.
+local function corpseParseInv(s)
+    local items, truncated = {}, false
+    if type(s) ~= "string" or #s < 2 then return items, false end
+    local i, n = 1, #s
+    local function skipWs() while i <= n and s:sub(i, i):match("%s") do i = i + 1 end end
+    -- reads a quoted string starting at i (which must be a quote); nil if it never closes
+    local function readStr()
+        if s:sub(i, i) ~= '"' then return nil end
+        i = i + 1
+        local out = {}
+        while i <= n do
+            local c = s:sub(i, i)
+            if c == "\\" then out[#out + 1] = s:sub(i + 1, i + 1); i = i + 2
+            elseif c == '"' then i = i + 1; return table.concat(out)
+            else out[#out + 1] = c; i = i + 1 end
+        end
+        return nil            -- ran off the end: truncated
+    end
+    -- consumes a balanced {...} or [...] and returns its raw text; nil if it never closes
+    local function readBalanced()
+        local open = s:sub(i, i)
+        local close = (open == "{") and "}" or "]"
+        local start, depth = i, 0
+        while i <= n do
+            local c = s:sub(i, i)
+            if c == '"' then
+                if not readStr() then return nil end
+            else
+                if c == open then depth = depth + 1
+                elseif c == close then
+                    depth = depth - 1
+                    if depth == 0 then i = i + 1; return s:sub(start, i - 1) end
+                end
+                i = i + 1
+            end
+        end
+        return nil
+    end
+    skipWs()
+    if s:sub(i, i) ~= "{" then return items, true end
+    i = i + 1
+    while i <= n do
+        skipWs()
+        local c = s:sub(i, i)
+        if c == "}" then break end
+        if c == "," then i = i + 1
+        elseif c == '"' then
+            local name = readStr()
+            if not name then truncated = true; break end
+            skipWs()
+            if s:sub(i, i) ~= ":" then truncated = true; break end
+            i = i + 1
+            skipWs()
+            local vc = s:sub(i, i)
+            local raw
+            if vc == "{" or vc == "[" then raw = readBalanced()
+            elseif vc == '"' then raw = readStr()
+            else
+                local st = i
+                while i <= n and not s:sub(i, i):match("[,}]") do i = i + 1 end
+                raw = s:sub(st, i - 1)
+                if i > n then raw = nil end       -- number ran off the end
+            end
+            if not raw then truncated = true; break end
+            local amt = tonumber(raw:match('"Amount"%s*:%s*(%-?%d+)') or "") or 1
+            items[#items + 1] = { name = name, amount = amt }
+        else
+            i = i + 1
+        end
+    end
+    return items, truncated
+end
+
+-- JSON string escape. Hand-rolled because we hand-roll the payload below.
+local function corpseEsc(s)
+    s = tostring(s or "")
+    s = s:gsub("\\", "\\\\"):gsub('"', '\\"')
+    s = s:gsub("[%z\1-\31]", function(c)
+        if c == "\n" then return "\\n" end
+        if c == "\r" then return "\\r" end
+        if c == "\t" then return "\\t" end
+        return string.format("\\u%04x", c:byte())
+    end)
+    return s
+end
+
+-- Discord embed. Lore name as the title, username underneath, inventory as an aligned code block
+-- so the amounts line up in the client.
+--
+-- The payload is BUILT BY HAND rather than via HttpService:JSONEncode. Two reasons, the first
+-- measured live: Matcha's encoder emits numbers as floats, so `color = 0xC8322D` serialises as
+-- "color":13120045.0 — and Discord rejects a non-integer colour with a 400. Matcha cannot read an
+-- HTTP status code at all (there is no RequestAsync), so that rejection would be COMPLETELY
+-- SILENT: no post, no error, nothing to debug. Second, this game's own notes already flag
+-- JSONEncode as unreliable on awkward tables. The shape here is fixed and tiny, so hand-rolling
+-- is both safer and shorter than defending against the encoder.
+local function corpseSend(e)
+    local url = CORPSE.Webhook
+    if type(url) ~= "string" or #url < 10 then return end
+    local lines = {}
+    for _, it in ipairs(e.items or {}) do
+        lines[#lines + 1] = string.format("%-26s x%d", it.name, it.amount)
+    end
+    if e.truncated then
+        lines[#lines + 1] = "... list cut off (game caps the read at 255 chars)"
+    end
+    local inv = (#lines > 0) and ("```\n" .. table.concat(lines, "\n") .. "\n```") or "_empty_"
+    local body = table.concat({
+        '{"embeds":[{',
+        '"title":"',       corpseEsc((e.lore ~= "" and e.lore) or "(no lore name)"), '",',
+        '"description":"', corpseEsc("**Username:** `" .. ((e.user ~= "" and e.user) or "?") .. "`"), '",',
+        '"color":13120045,',                       -- 0xC8322D as a plain INTEGER literal
+        '"fields":[{"name":"', corpseEsc("Inventory (" .. #(e.items or {}) .. ")"), '",',
+        '"value":"',       corpseEsc(inv), '"}]',
+        '}]}',
+    })
+    task.spawn(function()
+        pcall(function()
+            if type(httppost) == "function" then httppost(url, body, "application/json")
+            else game:HttpPost(url, body, "application/json") end
+        end)
+    end)
+    CORPSE.sent = CORPSE.sent + 1
+end
+
+-- Reads one corpse's attributes. Cheap: 3 GetAttribute calls, only on first sight.
+local function corpseRead(m)
+    local lore, user, inv = "", "", ""
+    pcall(function() lore = tostring(m:GetAttribute("LoreName") or "") end)
+    pcall(function() user = tostring(m:GetAttribute("PlayerName") or "") end)
+    pcall(function() inv  = tostring(m:GetAttribute("Inventory") or "") end)
+    local items, truncated = corpseParseInv(inv)
+    return lore, user, items, truncated
+end
+
+-- Position source. Corpses are ragdolled models, so PrimaryPart is often nil.
+local function corpsePart(m)
+    local p
+    pcall(function() p = m.PrimaryPart end)
+    if p then return p end
+    for _, nm in ipairs({ "HumanoidRootPart", "UpperTorso", "Torso", "Head" }) do
+        pcall(function() p = m:FindFirstChild(nm) end)
+        if p then return p end
+    end
+    return nil
+end
+
+-- Slow discovery pass. Corpses are few (single digits), so one folder read per tick is fine —
+-- but it still only runs when a Logs feature is on, and it never touches parts it already knows.
+function CORPSE.scan()
+    local folder = Workspace:FindFirstChild("World")
+    folder = folder and folder:FindFirstChild("Corpses")
+    if not folder then CORPSE.status = "no Corpses folder"; return end
+    local kids
+    if not pcall(function() kids = folder:GetChildren() end) then return end
+    if not kids then return end
+    local present = {}
+    for _, m in ipairs(kids) do
+        local key
+        pcall(function() key = tostring(m.Address) end)
+        if key then
+            present[key] = true
+            local e = CORPSE.entries[key]
+            if not e then
+                local lore, user, items, truncated = corpseRead(m)
+                e = { model = m, part = corpsePart(m), lore = lore, user = user,
+                      items = items, truncated = truncated }
+                CORPSE.entries[key] = e
+                -- Seeding: corpses already on the ground when you enable this are recorded but NOT
+                -- posted, so switching the toggle on in a busy server doesn't dump the backlog.
+                if CORPSE.seeded and CORPSE.Log and not CORPSE.seen[key] then
+                    CORPSE.seen[key] = true
+                    corpseSend(e)
+                else
+                    CORPSE.seen[key] = true
+                end
+            end
+        end
+    end
+    -- drop corpses that despawned
+    for key, e in pairs(CORPSE.entries) do
+        if not present[key] then
+            if e.bundle then pcall(function() e.bundle.name:Remove() end) end
+            CORPSE.entries[key] = nil
+        end
+    end
+    local n = 0
+    for _ in pairs(CORPSE.entries) do n = n + 1 end
+    CORPSE.tracked = n
+    CORPSE.seeded = true
+    CORPSE.status = n .. " tracked, " .. CORPSE.sent .. " sent"
+end
+
+-- Manual dump of everything on the ground right now, ignoring the seed rule.
+function CORPSE.fetchAll()
+    CORPSE.scan()
+    local n = 0
+    for _, e in pairs(CORPSE.entries) do corpseSend(e); n = n + 1 end
+    return n
+end
+
+-- ESP: one Text per corpse, created lazily and hidden rather than removed (same discipline as the
+-- player/titan renderer above — Drawing churn is what made the old build stutter).
+function CORPSE.draw()
+    local me
+    pcall(function()
+        local ch = LocalPlayer.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        me = hrp and hrp.Position
+    end)
+    for _, e in pairs(CORPSE.entries) do
+        local shown = false
+        if CORPSE.ESP and me then
+            if not e.part or not e.part.Parent then e.part = corpsePart(e.model) end
+            local pos
+            if e.part then pcall(function() pos = e.part.Position end) end
+            if pos then
+                local d = (pos - me).Magnitude
+                if d <= CORPSE.MaxDist then
+                    local ok, screen, on = pcall(WorldToScreen, pos + Vector3.new(0, 3, 0))
+                    if ok and screen and on then
+                        if not e.bundle then
+                            local okB, b = pcall(function()
+                                local t = Drawing.new("Text")
+                                t.Size = 13; t.Center = true; t.Outline = true
+                                t.Font = Drawing.Fonts.System; t.Visible = false; t.ZIndex = 3
+                                t.Color = Color3.fromRGB(235, 90, 85)
+                                return { name = t }
+                            end)
+                            e.bundle = okB and b or nil
+                        end
+                        if e.bundle then
+                            local label = ((e.lore ~= "" and e.lore) or "?")
+                                .. "  [" .. ((e.user ~= "" and e.user) or "?") .. "]"
+                                .. "  " .. math.floor(d) .. "m"
+                            if e.bundle._last ~= label then
+                                e.bundle.name.Text = label
+                                e.bundle._last = label
+                            end
+                            e.bundle.name.Position = Vector2.new(math.floor(screen.X + 0.5), math.floor(screen.Y + 0.5))
+                            e.bundle.name.Visible = true
+                            shown = true
+                        end
+                    end
+                end
+            end
+        end
+        if not shown and e.bundle then e.bundle.name.Visible = false end
+    end
+end
+
+-- Called by UnloadScript (which is defined ABOVE this block, so it reaches us through GUI).
+function GUI.CorpseCleanup()
+    for key, e in pairs(CORPSE.entries) do
+        if e.bundle and e.bundle.name then pcall(function() e.bundle.name:Remove() end) end
+        CORPSE.entries[key] = nil
+    end
+end
+
+-- One loop for both halves. Discovery is slow (2s) because corpses are static; the draw pass is
+-- 30Hz, which is plenty for a label that only follows a body lying on the ground.
+task.spawn(function()
+    local nextScan = 0
+    while GUI.Running do
+        pcall(function()
+            if CORPSE.ESP or CORPSE.Log then
+                local nowc = os.clock()
+                if nowc >= nextScan then nextScan = nowc + 2; CORPSE.scan() end
+                CORPSE.draw()
+            end
+        end)
+        task.wait(1 / 30)
     end
 end)
 
@@ -3320,6 +3705,15 @@ secTitan:Toggle("No Attack", Features.NoAttack, function(v)
     Features.NoAttack = v
     if v then applyNoAttack() else restoreNoAttack() end
 end)
+secTitan:Divider("Staff Bosses")
+secTitan:Toggle("Disable ALL Hitboxes", Features.NoAllHitboxes, function(v)
+    Features.NoAllHitboxes = v; refreshAntiTitan()
+end):Tooltip("kill every hitbox part whatever it's named - the one that works on staff bosses")
+secTitan:Toggle("Scan Workspace Bosses", Features.BossScan, function(v)
+    Features.BossScan = v
+    Reg.bossAt = 0            -- force an immediate rescan either way
+    refreshAntiTitan()
+end):Tooltip("register shifters parented at the Workspace root (Ogre, Abnormal) - they are NOT in World.Titans")
 secTitan:Divider("Hitbox Expander")
 secTitan:Toggle("Hitbox Expander", Features.NapeFollow, function(v)
     Features.NapeFollow = v
@@ -3368,6 +3762,43 @@ secRS:Label(function()
     return "Open the panel, then Snapshot / Compare on it."
 end)
 end  -- /Tools tab
+-- ===== Tab: Logs =====
+-- Corpse ESP + a Discord feed of who died and what they were carrying. The engine (CORPSE, defined
+-- above the tabs) owns the scan/draw loop; this tab is only the switches.
+do
+local tabLogs = window:Tab("Logs", "skull")
+
+local secCorpse = tabLogs:Section("Corpses", "Left", "Dead bodies in the world")
+secCorpse:Toggle("Corpse ESP", CORPSE.ESP, function(v) CORPSE.ESP = v end)
+    :Tooltip("draw each corpse's lore name, username and distance over the body")
+secCorpse:Toggle("Webhook Log", CORPSE.Log, function(v)
+    CORPSE.Log = v
+    if v then
+        -- Re-seed so bodies already lying around don't all fire the moment you flip this on.
+        CORPSE.seeded = false
+        toast("Corpse log armed - only NEW deaths post")
+    end
+end):Tooltip("post each NEW corpse to the Discord webhook once. Bodies already on the ground when you enable this are recorded, not posted")
+secCorpse:Slider("ESP Distance", CORPSE.MaxDist, 100, 100, 100000, "", function(v)
+    CORPSE.MaxDist = tonumber(v) or CORPSE.MaxDist
+end)
+
+secCorpse:Button("Post All Corpses Now", function()
+    task.spawn(function()
+        local n = CORPSE.fetchAll()
+        Lib:Notify("Corpses", "Posted " .. n .. " corpse(s) to the webhook", 3, "success")
+    end)
+end):Tooltip("ignore the seed rule and dump every body currently in the world")
+
+local secInfo = tabLogs:Section("Status", "Right", "Live")
+secInfo:Label(function() return "Tracked:  " .. (CORPSE.tracked or 0) end)
+secInfo:Label(function() return "Posted:   " .. (CORPSE.sent or 0) end)
+secInfo:Label(function() return tostring(CORPSE.status or "idle") end)
+secInfo:Label(function()
+    -- Worth surfacing: the inventory read is capped by the executor, not by us.
+    return "Inventory reads cap at 255 chars"
+end)
+end  -- /Logs tab
 -- ===== Settings tab (built-in) =====
 do
 local setTab = window:AddSettingsTab("cog")
