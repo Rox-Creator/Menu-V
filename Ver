@@ -4006,3 +4006,25 @@ end)
 Lib:Notify("Verfall", "loaded  -  F3 menu  -  F4 esp  -  End unload", 4)
 print("[Verfall] loaded with INS-ui front-end")
 FeatureLoop()
+
+-- ============================================================
+-- VERFALL_FILE_END
+-- ============================================================
+-- Sentinel for the loader. GitHub's raw host answers a rate-limited request with HTTP 429 and a
+-- ~199-byte body that begins "429: Too Many Requests" — and a naive
+--   loadstring(game:HttpGet(url))()
+-- happily tries to COMPILE that, which fails as:
+--   Matcha:1: Expected identifier when parsing expression, got '429'
+-- which looks like a broken script but is really a failed download.
+--
+-- Use a loader that checks the body actually reached the end of this file before running it:
+--
+--   local URL = "https://raw.githubusercontent.com/Rox-Creator/Menu-V/main/Ver"
+--   local src
+--   for i = 1, 5 do
+--       local ok, body = pcall(function() return game:HttpGet(URL) end)
+--       if ok and type(body) == "string" and #body > 10000
+--          and body:find("VERFALL_FILE_END", 1, true) then src = body break end
+--       task.wait(2 * i)                      -- back off; a 429 clears on its own
+--   end
+--   if src then loadstring(src)() else notify("Verfall: download failed (rate limited?)", "Verfall", 6) end
