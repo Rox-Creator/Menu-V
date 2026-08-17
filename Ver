@@ -3383,10 +3383,33 @@ local function corpseSend(e)
         lines[#lines + 1] = "... list cut off (game caps the read at 255 chars)"
     end
     local inv = (#lines > 0) and ("```\n" .. table.concat(lines, "\n") .. "\n```") or "_empty_"
+
+    -- Time of death. TimeOfDeath is a Unix epoch, which is exactly what Discord's <t:N:style>
+    -- token wants, so the client renders it in each viewer's OWN timezone.
+    --   F = full date+time ("Monday, 17 August 2026 10:23")
+    --   R = relative ("2 hours ago")
+    -- The epoch MUST be emitted as an integer: we hand-roll the JSON precisely because Matcha's
+    -- encoder would write it as 1786950537.0, and Discord would not parse that as a timestamp.
+    local tod = tonumber(e.tod)
+    local todText
+    if tod and tod > 0 then
+        local n = math.floor(tod)
+        todText = string.format("<t:%d:F>  (<t:%d:R>)", n, n)
+    else
+        todText = "_unknown_"
+    end
+
+    local desc = table.concat({
+        "**Roblox Username:** `" .. ((e.user ~= "" and e.user) or "?") .. "`",
+        "**Lore Name:** " .. ((e.lore ~= "" and e.lore) or "_none_"),
+        "**Time of Death:** " .. todText,
+    }, "\n")
+
     local body = table.concat({
         '{"embeds":[{',
-        '"title":"',       corpseEsc((e.lore ~= "" and e.lore) or "(no lore name)"), '",',
-        '"description":"', corpseEsc("**Username:** `" .. ((e.user ~= "" and e.user) or "?") .. "`"), '",',
+        -- title is the ROBLOX USERNAME (the account), not the in-game lore name
+        '"title":"',       corpseEsc((e.user ~= "" and e.user) or "(unknown user)"), '",',
+        '"description":"', corpseEsc(desc), '",',
         '"color":13120045,',                       -- 0xC8322D as a plain INTEGER literal
         '"fields":[{"name":"', corpseEsc("Inventory (" .. #(e.items or {}) .. ")"), '",',
         '"value":"',       corpseEsc(inv), '"}]',
@@ -3404,11 +3427,15 @@ end
 -- Reads one corpse's attributes. Cheap: 3 GetAttribute calls, only on first sight.
 local function corpseRead(m)
     local lore, user, inv = "", "", ""
+    local tod
     pcall(function() lore = tostring(m:GetAttribute("LoreName") or "") end)
     pcall(function() user = tostring(m:GetAttribute("PlayerName") or "") end)
     pcall(function() inv  = tostring(m:GetAttribute("Inventory") or "") end)
+    -- TimeOfDeath is a Unix epoch NUMBER (e.g. 1786950537). Numbers aren't subject to the
+    -- 255-char string cap, so this one always comes back whole.
+    pcall(function() tod = tonumber(m:GetAttribute("TimeOfDeath")) end)
     local items, truncated = corpseParseInv(inv)
-    return lore, user, items, truncated
+    return lore, user, items, truncated, tod
 end
 
 -- Position source. Corpses are ragdolled models, so PrimaryPart is often nil.
@@ -3440,9 +3467,9 @@ function CORPSE.scan()
             present[key] = true
             local e = CORPSE.entries[key]
             if not e then
-                local lore, user, items, truncated = corpseRead(m)
+                local lore, user, items, truncated, tod = corpseRead(m)
                 e = { model = m, part = corpsePart(m), lore = lore, user = user,
-                      items = items, truncated = truncated }
+                      items = items, truncated = truncated, tod = tod }
                 CORPSE.entries[key] = e
                 -- Seeding: corpses already on the ground when you enable this are recorded but NOT
                 -- posted, so switching the toggle on in a busy server doesn't dump the backlog.
