@@ -3264,12 +3264,23 @@ local CORPSE = {
     Webhook    = "https://discord.com/api/webhooks/1538981288600543273/2YmfRty0QHcNQWU1pOoUHEI3ruEphkouajbDP3hrMjpYI715ECxmjW33aWhI8xNoHnDK",
     MaxDist    = 100000,
     MaxDraw    = 12,           -- hard cap on labels per frame, so a graveyard can't flood the renderer
+    -- ⚠ DISCORD RATE SAFETY. A webhook may send ~30 messages/minute to a channel. The first version
+    -- of this drained the outbox at one POST per SECOND (60/min) — double the ceiling — and the
+    -- broken seed gate meant flipping the toggle on queued the ENTIRE graveyard, so it sat at that
+    -- rate for minutes. Discord answers sustained abuse by DELETING the webhook, and two webhooks
+    -- died back-to-back that way (both verified returning 404 "Unknown Webhook", code 10015).
+    -- 3s = 20/min leaves comfortable headroom; the cap stops a backlog from ever getting long.
+    PostEvery  = 3,
+    OutboxMax  = 40,
+    dropped    = 0,            -- posts discarded because the outbox was already full
+    lastError  = nil,          -- last error message Discord sent back, surfaced in the Status panel
     me         = nil,          -- our own position, sampled on the slow loop (never per frame)
     order      = nil,          -- round-robin cursor for the chunked position sampler
     oi         = 1,
     entries    = {},           -- [key] = { key, model, part, lore, user, items, truncated, pos, bundle }
     pending    = {},           -- corpses discovered but not yet read (expensive work, 1 per tick)
     queued     = {},           -- [key] = true while it sits in `pending`, so it is queued once
+    bad        = {},           -- [key] = true for models that failed liveness 3x; stops a re-queue loop
     outbox     = {},           -- webhook posts waiting to go out, at most 1/sec (HTTP BLOCKS)
     nextPost   = 0,
     scanMs     = 0, workMs = 0, postMs = 0,   -- per-phase cost, surfaced in the Status panel
@@ -3423,13 +3434,23 @@ local function corpseSend(e)
         '"value":"',       corpseEsc(inv), '"}]',
         '}]}',
     })
-    task.spawn(function()
-        pcall(function()
-            if type(httppost) == "function" then httppost(url, body, "application/json")
-            else game:HttpPost(url, body, "application/json") end
-        end)
+    -- Called directly, NOT via task.spawn. Matcha is single-threaded and cooperative, so task.spawn
+    -- never made this async anyway — it only threw away the response. work() already rate-limits us.
+    local resp
+    pcall(function()
+        if type(httppost) == "function" then resp = httppost(url, body, "application/json")
+        else resp = game:HttpPost(url, body, "application/json") end
     end)
-    CORPSE.sent = CORPSE.sent + 1
+    -- ⚠ Matcha exposes NO HTTP status code (there is no RequestAsync), so a rejected post used to be
+    -- COMPLETELY silent — no post, no error, nothing to debug. That is exactly how a deleted webhook
+    -- looked like "the script is broken". Discord does return a JSON error body, so read that and
+    -- surface it in the Status panel: {"message": "Unknown Webhook", "code": 10015}.
+    if type(resp) == "string" and resp:find('"message"', 1, true) then
+        CORPSE.lastError = resp:match('"message"%s*:%s*"([^"]*)"') or "rejected"
+    else
+        CORPSE.lastError = nil
+        CORPSE.sent = CORPSE.sent + 1
+    end
 end
 
 -- Reads one corpse's attributes. Cheap: 3 GetAttribute calls, only on first sight.
@@ -3484,9 +3505,16 @@ function CORPSE.scan()
         local key = ad and string.format("%.0f", ad) or nil
         if key then
             present[key] = true
-            if not CORPSE.entries[key] and not CORPSE.queued[key] then
+            if not CORPSE.entries[key] and not CORPSE.queued[key] and not CORPSE.bad[key] then
                 CORPSE.queued[key] = true
-                CORPSE.pending[#CORPSE.pending + 1] = { key = key, model = m }
+                -- ⚠ STAMP THE SEED DECISION *HERE*, not at adoption time. This loop runs BEFORE
+                -- the `CORPSE.seeded = true` at the bottom of this function, so CORPSE.seeded still
+                -- holds its PRE-SCAN value — which is the entire point of the flag. Before the
+                -- scan/work split the check lived in this same loop and worked; afterwards it was
+                -- read in work(), which runs strictly LATER in the same tick and therefore always
+                -- saw `true`, so "don't dump the backlog when the toggle is switched on" never fired.
+                CORPSE.pending[#CORPSE.pending + 1] =
+                    { key = key, model = m, post = (CORPSE.seeded and CORPSE.Log) and true or false }
             end
         end
     end
@@ -3495,6 +3523,12 @@ function CORPSE.scan()
         if not present[key] then
             if e.bundle then pcall(function() e.bundle.name:Remove() end) end
             CORPSE.entries[key] = nil
+            -- CLEAR `seen` AND `bad` TOO. The key is a raw heap address and Roblox recycles them,
+            -- so a brand-new corpse can be allocated on a dead one's address. Leaving the flag set
+            -- made that death permanently un-postable while the ESP still drew it perfectly — a
+            -- webhook that goes quiet over time for no visible reason.
+            CORPSE.seen[key] = nil
+            CORPSE.bad[key]  = nil
             CORPSE.order = nil      -- membership changed: rebuild the sampler cursor
         end
     end
@@ -3506,38 +3540,74 @@ function CORPSE.scan()
     CORPSE.status = n .. " tracked, " .. CORPSE.sent .. " sent, " .. #CORPSE.pending .. " queued"
 end
 
--- THE EXPENSIVE HALF, BUDGETED. Runs on every loop tick but does at most ONE new corpse and at
--- most ONE webhook POST, so neither can ever pile up into a single blocking burst.
+-- Adopt ONE discovered corpse: read its attributes and enter it into the live set. Shared by the
+-- timed work() path and the manual "Queue All Corpses" button so the two can never drift apart
+-- again (they did: fetchAll harvested a table only the OTHER path filled). Returns true if adopted.
+function CORPSE.adopt(job)
+    CORPSE.queued[job.key] = nil
+    local m = job.model
+    local alive = false
+    pcall(function() alive = m.Parent ~= nil end)
+    if not alive then
+        -- Strike it out rather than silently dropping it. scan() re-queues anything missing from
+        -- `entries`, so without a strike count one un-readable model bounces between scan() and
+        -- work() forever, keeping `pending` permanently non-empty.
+        job.fails = (job.fails or 0) + 1
+        if job.fails >= 3 then
+            CORPSE.bad[job.key] = true
+        else
+            CORPSE.queued[job.key] = true
+            CORPSE.pending[#CORPSE.pending + 1] = job
+        end
+        return false
+    end
+    local lore, user, items, truncated, tod = corpseRead(m)
+    local e = { key = job.key, model = m, part = corpsePart(m), lore = lore, user = user,
+                items = items, truncated = truncated, tod = tod }
+    CORPSE.entries[job.key] = e
+    -- APPEND to the sampler cursor instead of nil-ing it. Nil-ing rebuilt the round-robin list from
+    -- scratch on every adoption, resetting oi to 1 — so while a queue was draining, only the first
+    -- ~6 entries ever got a position and the rest stayed e.pos == nil (invisible to the ESP).
+    if CORPSE.order then CORPSE.order[#CORPSE.order + 1] = e end
+    -- `job.post` was decided at DISCOVERY time in scan(), while CORPSE.seeded still meant something.
+    if job.post and not CORPSE.seen[job.key] then
+        CORPSE.enqueue(e)
+        CORPSE.seen[job.key] = true
+    end
+    return true
+end
+
+-- Queue one post, refusing to let the backlog grow without bound. An unbounded outbox is how a
+-- graveyard turns into several minutes of continuous POSTing, which is what gets a webhook deleted.
+function CORPSE.enqueue(e)
+    if #CORPSE.outbox >= CORPSE.OutboxMax then
+        CORPSE.dropped = CORPSE.dropped + 1
+        return false
+    end
+    CORPSE.outbox[#CORPSE.outbox + 1] = e
+    return true
+end
+
+-- THE EXPENSIVE HALF, BUDGETED. Runs on every loop tick but reads at most ONE new corpse and sends
+-- at most ONE webhook, so neither can ever pile up into a single blocking burst.
 function CORPSE.work(nowc)
     -- 1) adopt one queued corpse (4 GetAttribute + up to 5 FindFirstChild)
     if #CORPSE.pending > 0 then
         local t0 = os.clock()
-        local job = table.remove(CORPSE.pending, 1)
-        CORPSE.queued[job.key] = nil
-        local m = job.model
-        local alive = false
-        pcall(function() alive = m.Parent ~= nil end)
-        if alive then
-            local lore, user, items, truncated, tod = corpseRead(m)
-            local e = { key = job.key, model = m, part = corpsePart(m), lore = lore, user = user,
-                        items = items, truncated = truncated, tod = tod }
-            CORPSE.entries[job.key] = e
-            CORPSE.order = nil
-            -- Seeding: bodies already on the ground when you enable this are recorded, not posted.
-            if CORPSE.seeded and CORPSE.Log and not CORPSE.seen[job.key] then
-                CORPSE.outbox[#CORPSE.outbox + 1] = e
-            end
-            CORPSE.seen[job.key] = true
-        end
+        CORPSE.adopt(table.remove(CORPSE.pending, 1))
         CORPSE.workMs = (os.clock() - t0) * 1000
-        return                                  -- one job per tick, never two
     end
     -- 2) send at most one webhook, and never more often than once a second.
     -- httppost is a SYNCHRONOUS bridge op — task.spawn does not make it async, because Matcha is
-    -- single-threaded and cooperative. Every POST blocks the whole VM for its round-trip, so the
-    -- only defence is to make sure they can never happen back-to-back.
+    -- single-threaded and cooperative. Every POST blocks the whole VM for its round-trip.
+    --
+    -- ⚠ This is deliberately NOT behind an early `return` from step 1 any more. The nextPost gate
+    -- below already caps posting at one per second, which is what actually prevented the freeze;
+    -- the extra `return` only meant that while ANY corpse was waiting to be read the outbox could
+    -- not drain at all — and combined with the re-queue loop above, that silenced the webhook
+    -- permanently. One attribute read plus at most one POST per second is a bounded tick.
     if #CORPSE.outbox > 0 and nowc >= (CORPSE.nextPost or 0) then
-        CORPSE.nextPost = nowc + 1
+        CORPSE.nextPost = nowc + (CORPSE.PostEvery or 3)
         local e = table.remove(CORPSE.outbox, 1)
         local t0 = os.clock()
         corpseSend(e)
@@ -3548,11 +3618,26 @@ end
 -- Manual dump of everything on the ground right now, ignoring the seed rule. QUEUES them rather
 -- than sending inline: posting N corpses in a loop would be N blocking HTTP calls back-to-back,
 -- which freezes the game for as long as that takes. The outbox drains at 1/sec.
+-- ⚠ THE BUG THAT MADE THIS BUTTON DO NOTHING: scan() used to adopt corpses inline, so by the time
+-- the harvest loop below ran, CORPSE.entries held every body in the world. After the scan/work
+-- split, scan() only fills `pending` — the sole writer of `entries` is work(), on its own timer —
+-- so on a fresh run this iterated an EMPTY table, queued 0 and reported success. Adopt what our
+-- own scan() just discovered before harvesting.
 function CORPSE.fetchAll()
     CORPSE.scan()
+    -- This is an explicit, user-initiated one-shot, so the burst of attribute reads is acceptable
+    -- here — it was the back-to-back blocking POSTs that froze the game, and those are still capped
+    -- at 1/sec by the outbox. We yield every few corpses anyway so a graveyard can't hitch the menu.
+    local tries = 0
+    while #CORPSE.pending > 0 and tries < 500 do   -- bounded: adopt() can re-queue a failed model
+        tries = tries + 1
+        CORPSE.adopt(table.remove(CORPSE.pending, 1))
+        if tries % 6 == 0 then task.wait() end
+    end
     local n = 0
     for _, e in pairs(CORPSE.entries) do
-        CORPSE.outbox[#CORPSE.outbox + 1] = e
+        if not CORPSE.enqueue(e) then break end   -- outbox full; the rest are counted as dropped
+        CORPSE.seen[e.key] = true                 -- so the timed path doesn't post it a second time
         n = n + 1
     end
     return n
@@ -3583,8 +3668,16 @@ function CORPSE.sample()
         if e and CORPSE.entries[e.key] then
             -- Only re-resolve the part when we have none AND enough time has passed. Without the
             -- retry gate a corpse whose part never resolves burns 5 lookups every single tick.
+            -- pcall returns (success, f's-first-result). The old form here was
+            --   ok = pcall(f) and true or false
+            -- which consumed ONLY the success flag and threw away the `.Parent ~= nil` answer, so a
+            -- corpse whose limb had been destroyed still read as live, was never re-resolved, and
+            -- its label stayed pinned to a stale position.
             local ok = false
-            if e.part then ok = pcall(function() return e.part.Parent ~= nil end) and true or false end
+            if e.part then
+                local sOk, live = pcall(function() return e.part.Parent ~= nil end)
+                ok = (sOk and live == true)
+            end
             if not e.part or not ok then
                 local nowc = os.clock()
                 if (e.nextPart or 0) <= nowc then
@@ -3634,12 +3727,34 @@ function CORPSE.draw()
                         end
                         e.bundle.name.Position = Vector2.new(math.floor(screen.X + 0.5), math.floor(screen.Y + 0.5))
                         e.bundle.name.Visible = true
+                        e.bundle._vis = true
                         shown, drawn = true, drawn + 1
                     end
                 end
             end
         end
-        if not shown and e.bundle and e.bundle.name.Visible then e.bundle.name.Visible = false end
+        -- Track visibility in a shadow field rather than reading .Visible back off the Drawing.
+        -- This mirrors the player/titan renderer's setVis/hideBundle discipline in this same file,
+        -- which never reads a Drawing property back either.
+        if not shown and e.bundle and e.bundle._vis then
+            e.bundle.name.Visible = false
+            e.bundle._vis = false
+        end
+    end
+end
+
+-- Hide every corpse label right now. ⚠ THIS IS WHY LABELS LINGERED: the ONLY code that ever set a
+-- label invisible lived inside draw(), and draw() is called from inside the loop's
+-- `if CORPSE.ESP or CORPSE.Log` gate. Switching Corpse ESP off (with the webhook off too) closed
+-- that gate, so draw() was never called again and the last frame's labels stayed on screen
+-- permanently — the toggle callback only assigned the flag and touched no Drawing at all.
+function CORPSE.hideAll()
+    for _, e in pairs(CORPSE.entries) do
+        local b = e.bundle
+        if b and b.name and b._vis then
+            pcall(function() b.name.Visible = false end)
+            b._vis = false
+        end
     end
 end
 
@@ -3661,19 +3776,30 @@ do
     local gen = {}
     _G.__VERFALL_CORPSE = gen
     task.spawn(function()
-        local nextScan, nextSample = 0, 0
+        local nextScan, nextSample, wasActive = 0, 0, false
         while GUI.Running and _G.__VERFALL_CORPSE == gen do
+            local active = CORPSE.ESP or CORPSE.Log
+            -- Outstanding work has to keep moving even with BOTH toggles off, or anything the
+            -- "Queue All Corpses" button queues sits in the outbox forever — its only consumer
+            -- (work) used to live inside the `active` gate, so the button appeared to do nothing.
+            local busy = (#CORPSE.outbox > 0) or (#CORPSE.pending > 0)
             pcall(function()
-                if CORPSE.ESP or CORPSE.Log then
-                    local nowc = os.clock()
+                local nowc = os.clock()
+                if active then
                     if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
                     if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
-                    CORPSE.work(nowc)      -- one queued corpse OR one webhook, never a burst
+                end
+                if active or busy then CORPSE.work(nowc) end
+                if active then
                     CORPSE.draw()
+                elseif wasActive then
+                    CORPSE.hideAll()   -- falling edge: draw() is gated off, so clear labels here
                 end
             end)
-            -- Idle cheaply while both switches are off: 4Hz is plenty to notice one being flipped.
-            task.wait((CORPSE.ESP or CORPSE.Log) and (1 / 30) or 0.25)
+            wasActive = active
+            -- Idle cheaply while both switches are off AND nothing is queued: 4Hz is plenty to
+            -- notice one being flipped.
+            task.wait((active or busy) and (1 / 30) or 0.25)
         end
         -- superseded or unloaded: drop our own Drawings so they can't linger on screen
         pcall(function() if GUI.CorpseCleanup then GUI.CorpseCleanup() end end)
@@ -3898,8 +4024,12 @@ do
 local tabLogs = window:Tab("Logs", "skull")
 
 local secCorpse = tabLogs:Section("Corpses", "Left", "Dead bodies in the world")
-secCorpse:Toggle("Corpse ESP", CORPSE.ESP, function(v) CORPSE.ESP = v end)
-    :Tooltip("draw each corpse's lore name, username and distance over the body")
+secCorpse:Toggle("Corpse ESP", CORPSE.ESP, function(v)
+    CORPSE.ESP = v
+    -- Clear the labels the instant the switch flips. The loop's falling-edge hideAll() is the
+    -- backstop; this makes it immediate instead of up to one idle tick (250ms) later.
+    if not v then pcall(CORPSE.hideAll) end
+end):Tooltip("draw each corpse's lore name, username and distance over the body")
 secCorpse:Toggle("Webhook Log", CORPSE.Log, function(v)
     CORPSE.Log = v
     if v then
@@ -3928,8 +4058,13 @@ secInfo:Label(function()
     return string.format("scan %.0fms  read %.0fms  post %.0fms",
         CORPSE.scanMs or 0, CORPSE.workMs or 0, CORPSE.postMs or 0)
 end)
+-- ⚠ THE MOST IMPORTANT LINE IN THIS PANEL. Matcha cannot read an HTTP status code, so before this
+-- a deleted webhook, a malformed embed and a rate-limit ban were all indistinguishable from "the
+-- feature is broken". Discord's error message now shows up here instead.
+-- "Unknown Webhook" = the webhook was deleted; make a new one in Discord and paste it in.
 secInfo:Label(function()
-    -- Worth surfacing: the inventory read is capped by the executor, not by us.
+    if CORPSE.lastError then return "Discord says: " .. tostring(CORPSE.lastError) end
+    if (CORPSE.dropped or 0) > 0 then return "dropped " .. CORPSE.dropped .. " (outbox full)" end
     return "Inventory reads cap at 255 chars"
 end)
 end  -- /Logs tab
