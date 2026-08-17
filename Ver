@@ -847,13 +847,18 @@ local VELO = {
 
 -- Which fonts THIS build actually exposes. Discovered rather than hardcoded: Drawing.Fonts differs
 -- between executors, and assigning an unknown key would silently set .Font = nil.
+-- The names come from the UI library, which is proof of what this executor exposes: it resolves
+-- ao.System / ao.SystemBold / ao.UI / ao.Monospace off Drawing.Fonts and uses the results as table
+-- KEYS, so they are plain values (numbers) and are safe to assign to .Font at any time.
+-- Each index is pcall'd INDIVIDUALLY: one shared pcall around the loop would abandon the whole scan
+-- at the first name this build happens not to have.
 local VELO_FONTS = {}
 do
-    pcall(function()
-        for _, n in ipairs({ "System", "SystemBold", "UI", "Plex", "Monospace", "Pixel" }) do
-            if Drawing.Fonts and Drawing.Fonts[n] ~= nil then VELO_FONTS[#VELO_FONTS + 1] = n end
-        end
-    end)
+    for _, n in ipairs({ "System", "SystemBold", "UI", "Monospace", "Plex", "Pixel" }) do
+        local v
+        pcall(function() v = Drawing.Fonts and Drawing.Fonts[n] end)
+        if v ~= nil then VELO_FONTS[#VELO_FONTS + 1] = n end
+    end
     if #VELO_FONTS == 0 then VELO_FONTS = { "System" } end
 end
 local function veloFont(name)
@@ -3133,13 +3138,24 @@ secVelo:Slider("Bracket Spacing", VELO.pad, 1, 0, 6, "", function(v)
     VELO.saveAt = os.clock() + 0.6
 end):Tooltip("spaces inside the brackets - 0 gives [185], 1 gives [ 185 ]")
 secVelo:Dropdown("Font", VELO.fontName, VELO_FONTS, false, function(v)
-    -- The dropdown hands back the chosen string; validate it against what this build actually has
-    -- rather than trusting it, since an unknown name would set .Font = nil.
-    local pick = tostring(v)
+    -- ⚠ THE DROPDOWN HANDS BACK A TABLE, EVEN FOR SINGLE-SELECT. In the library, a control's value
+    -- goes through a2() which wraps any scalar into { v }, and the commit path ends with
+    -- cN(cQ.callback, cQ.value) — so this receives {"SystemBold"}, not "SystemBold". Calling
+    -- tostring() on it yielded "table: 0x..." which matched no font name, so the selection silently
+    -- did nothing while the dropdown still displayed the new value (the library updates its own
+    -- display before invoking the callback). Unwrap first, then validate.
+    local pick = v
+    if type(pick) == "table" then pick = pick[1] end
+    pick = tostring(pick or "")
     for _, n in ipairs(VELO_FONTS) do
         if n == pick then VELO.fontName = pick; VELO.saveAt = os.clock() + 0.6; return end
     end
 end):Tooltip("fonts this executor build actually exposes")
+-- Shows what is ACTUALLY applied, not what the dropdown thinks is selected. Those two disagreeing
+-- is exactly the bug above, and it was invisible without this.
+secVelo:Label(function()
+    return "font: " .. tostring(VELO.fontName) .. "   size: " .. tostring(VELO.size)
+end)
 
 end  -- /Main tab
 -- ===== Tab: Character =====
