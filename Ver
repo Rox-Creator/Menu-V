@@ -835,12 +835,36 @@ end
 local VELO = {
     gen = 0, o = nil,           -- generation token + the Drawing object
     x = nil, y = nil,           -- nil = "not placed yet", resolved to a default on first draw
-    saveAt = nil,               -- debounced write (dragging fires continuously)
+    size = 15,                  -- text size            (slider)
+    pad  = 1,                   -- spaces inside the brackets: 1 -> "[ 124 ]", 0 -> "[124]"
+    fontName = "System",        -- resolved against Drawing.Fonts at apply time (dropdown)
+    saveAt = nil,               -- debounced write (dragging and sliders both fire continuously)
     Path = CONFIG_DIR .. "/velohud.txt",
     drag = false, dx = 0, dy = 0,
     last = nil,                 -- last rendered string, so we only write .Text when it changes
+    lastSize = nil, lastFont = nil,   -- so .Size/.Font are written on change, not every tick
 }
 
+-- Which fonts THIS build actually exposes. Discovered rather than hardcoded: Drawing.Fonts differs
+-- between executors, and assigning an unknown key would silently set .Font = nil.
+local VELO_FONTS = {}
+do
+    pcall(function()
+        for _, n in ipairs({ "System", "SystemBold", "UI", "Plex", "Monospace", "Pixel" }) do
+            if Drawing.Fonts and Drawing.Fonts[n] ~= nil then VELO_FONTS[#VELO_FONTS + 1] = n end
+        end
+    end)
+    if #VELO_FONTS == 0 then VELO_FONTS = { "System" } end
+end
+local function veloFont(name)
+    local f
+    pcall(function() f = Drawing.Fonts[name] end)
+    if f == nil then pcall(function() f = Drawing.Fonts.System end) end
+    return f
+end
+
+-- key=value per line, so new settings can be added without breaking an existing file. The very
+-- first version of this wrote a bare "x,y" line, so that shape is still accepted.
 function VELO.load()
     if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
     local exists = false
@@ -848,19 +872,36 @@ function VELO.load()
     if not exists then return end
     local ok, raw = pcall(readfile, VELO.Path)
     if not (ok and type(raw) == "string") then return end
-    local x, y = raw:match("^%s*(-?%d+%.?%d*)%s*,%s*(-?%d+%.?%d*)")
-    x, y = tonumber(x), tonumber(y)
-    if x and y then VELO.x, VELO.y = x, y end
+    local x, y = raw:match("^%s*(-?%d+%.?%d*)%s*,%s*(-?%d+%.?%d*)%s*$")   -- legacy "x,y"
+    if x and y then VELO.x, VELO.y = tonumber(x), tonumber(y) end
+    for k, v in raw:gmatch("(%w+)%s*=%s*([^\r\n]*)") do
+        v = (v:gsub("%s+$", ""))
+        if     k == "x"    then VELO.x    = tonumber(v) or VELO.x
+        elseif k == "y"    then VELO.y    = tonumber(v) or VELO.y
+        elseif k == "size" then VELO.size = math.max(6, math.min(tonumber(v) or VELO.size, 64))
+        elseif k == "pad"  then VELO.pad  = math.max(0, math.min(tonumber(v) or VELO.pad, 8))
+        elseif k == "font" and v ~= "" then VELO.fontName = v end
+    end
 end
 
 function VELO.save()
-    if type(writefile) ~= "function" or not (VELO.x and VELO.y) then return end
+    if type(writefile) ~= "function" then return end
     pcall(function()
         if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
             makefolder(CONFIG_DIR)
         end
     end)
-    pcall(writefile, VELO.Path, string.format("%d,%d", math.floor(VELO.x), math.floor(VELO.y)))
+    local out = {}
+    -- Only persist the position once it actually has one, or changing a setting before the HUD has
+    -- ever been shown would pin it to 0,0 on the next launch.
+    if VELO.x and VELO.y then
+        out[#out + 1] = "x=" .. math.floor(VELO.x)
+        out[#out + 1] = "y=" .. math.floor(VELO.y)
+    end
+    out[#out + 1] = "size=" .. tostring(VELO.size)
+    out[#out + 1] = "pad="  .. tostring(VELO.pad)
+    out[#out + 1] = "font=" .. tostring(VELO.fontName)
+    pcall(writefile, VELO.Path, table.concat(out, "\n"))
 end
 
 VELO.load()
@@ -879,10 +920,10 @@ applyVeloHUD = function()
 
     local ok, t = pcall(function()
         local d = Drawing.new("Text")
-        d.Size = 15
+        d.Size = VELO.size
         d.Center = false
         d.Outline = true                        -- 1px outline; plain white is unreadable on snow
-        d.Font = Drawing.Fonts.System
+        d.Font = veloFont(VELO.fontName)
         d.Color = Color3.fromRGB(255, 255, 255)
         d.ZIndex = 90
         d.Visible = false
@@ -890,6 +931,7 @@ applyVeloHUD = function()
     end)
     if not (ok and t) then return end
     VELO.o = t
+    VELO.lastSize, VELO.lastFont = VELO.size, VELO.fontName
 
     task.spawn(function()
         local vpW, vpH, vpAccum = 1920, 1080, 99
@@ -917,7 +959,16 @@ applyVeloHUD = function()
                 end
             end)
 
-            local s = "[ " .. math.floor(speed + 0.5) .. " ]"
+            -- Size and font are written ONLY when they change — a Drawing property write per tick
+            -- would be pointless churn for a value that only moves when you touch a slider.
+            if VELO.lastSize ~= VELO.size then VELO.lastSize = VELO.size; t.Size = VELO.size end
+            if VELO.lastFont ~= VELO.fontName then
+                VELO.lastFont = VELO.fontName
+                t.Font = veloFont(VELO.fontName)
+            end
+
+            local sp = string.rep(" ", math.max(0, math.floor(VELO.pad or 1)))
+            local s = "[" .. sp .. math.floor(speed + 0.5) .. sp .. "]"
             if VELO.last ~= s then VELO.last = s; t.Text = s end
 
             -- DRAG, only while the menu is open. ismouse1pressed is executor-local and free, so
@@ -930,8 +981,9 @@ applyVeloHUD = function()
                 local mx, my = Mouse.X, Mouse.Y
                 if not wasDown then
                     -- grab test: approximate the text box from the string length (Matcha's Drawing
-                    -- exposes no TextBounds), padded so it is comfortable to hit
-                    local w, h = #s * t.Size * 0.62 + 8, t.Size + 8
+                    -- exposes no TextBounds), padded so it is comfortable to hit. Uses VELO.size so
+                    -- the hitbox tracks the slider immediately.
+                    local w, h = #s * VELO.size * 0.62 + 8, VELO.size + 8
                     if mx >= VELO.x - 4 and mx <= VELO.x + w and my >= VELO.y - 4 and my <= VELO.y + h then
                         VELO.drag, VELO.dx, VELO.dy = true, mx - VELO.x, my - VELO.y
                     end
@@ -2211,7 +2263,11 @@ resetConfig = function()
     pcall(restoreHorseWatch)
     if Horse.SnapTaken then restoreHorse() end
     Horse.MaxSpeed = 65
-    VELO.x, VELO.y = nil, nil     -- back to the default screen position
+    -- Velo HUD back to stock: default position, size, spacing and font.
+    VELO.x, VELO.y = nil, nil
+    VELO.size, VELO.pad, VELO.fontName = 15, 1, "System"
+    VELO.lastSize, VELO.lastFont = nil, nil
+    VELO.saveAt = os.clock()      -- persist the reset on the next loop tick
 end
 
 -- ============================================================
@@ -3004,6 +3060,13 @@ do
                     CORPSE.saveAt = nil
                     CORPSE.saveWebhook()
                 end
+                -- Velo HUD settings ride the same always-on loop. Their own render loop only runs
+                -- while the HUD is ENABLED, so without this a size/font change made with the HUD
+                -- switched off would never reach disk.
+                if VELO.saveAt and nowc >= VELO.saveAt then
+                    VELO.saveAt = nil
+                    VELO.save()
+                end
                 if active then
                     if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
                     if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
@@ -3052,10 +3115,31 @@ secVis:Toggle("Nape HP Only", Features.TitanHPOnly, function(v) Features.TitanHP
 -- down (every tab after this one, the startup re-apply and the unload watcher included).
 secVis:Toggle("Cap (horde perf)", Features.TitanCap, function(v) Features.TitanCap = v end)
     :Tooltip("tighten the titan draw limit from 18 to 8 for a big horde")
-secVis:Toggle("Velo HUD", Features.VeloHUD, function(v)
+local secVelo = tabMain:Section("Velo HUD", "Left", "On-Screen Speed")
+secVelo:Toggle("Velo HUD", Features.VeloHUD, function(v)
     Features.VeloHUD = v
     if v then applyVeloHUD() else restoreVeloHUD() end
-end):Tooltip("plain [ 185 ] velocity readout - drag it anywhere while the menu is open")
+end):Tooltip("drag it anywhere while the menu is open - the position is saved")
+-- All three settings write through the same debounce: a slider fires its callback on every step of
+-- the drag, and a file write per step is the same disk stutter the library's autosave was turned
+-- off for. VELO.saveAt is serviced by the always-running corpse loop, so it lands even with the
+-- HUD switched off.
+secVelo:Slider("Text Size", VELO.size, 1, 8, 48, "", function(v)
+    VELO.size = tonumber(v) or VELO.size
+    VELO.saveAt = os.clock() + 0.6
+end):Tooltip("size of the [ 185 ] readout")
+secVelo:Slider("Bracket Spacing", VELO.pad, 1, 0, 6, "", function(v)
+    VELO.pad = math.max(0, math.floor(tonumber(v) or VELO.pad))
+    VELO.saveAt = os.clock() + 0.6
+end):Tooltip("spaces inside the brackets - 0 gives [185], 1 gives [ 185 ]")
+secVelo:Dropdown("Font", VELO.fontName, VELO_FONTS, false, function(v)
+    -- The dropdown hands back the chosen string; validate it against what this build actually has
+    -- rather than trusting it, since an unknown name would set .Font = nil.
+    local pick = tostring(v)
+    for _, n in ipairs(VELO_FONTS) do
+        if n == pick then VELO.fontName = pick; VELO.saveAt = os.clock() + 0.6; return end
+    end
+end):Tooltip("fonts this executor build actually exposes")
 
 end  -- /Main tab
 -- ===== Tab: Character =====
