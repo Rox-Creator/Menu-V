@@ -3263,7 +3263,11 @@ local CORPSE = {
     Log        = false,        -- POST new corpses to the webhook
     Webhook    = "https://discord.com/api/webhooks/1538808588343058593/HpfS6OmXiRgaNZoxgQxiso5gBXCj6Wz8GQwEHsBc5eBUSa9ETwXSLUY9Yr-wBOb_hee4",
     MaxDist    = 100000,
-    entries    = {},           -- [key] = { model, part, lore, user, items, truncated, pos, dist, bundle }
+    MaxDraw    = 12,           -- hard cap on labels per frame, so a graveyard can't flood the renderer
+    me         = nil,          -- our own position, sampled on the slow loop (never per frame)
+    order      = nil,          -- round-robin cursor for the chunked position sampler
+    oi         = 1,
+    entries    = {},           -- [key] = { key, model, part, lore, user, items, truncated, pos, bundle }
     seen       = {},           -- [key] = true, so each corpse is posted at most once
     seeded     = false,        -- first scan only records; it never floods the channel on enable
     sent       = 0,
@@ -3467,9 +3471,10 @@ function CORPSE.scan()
             local e = CORPSE.entries[key]
             if not e then
                 local lore, user, items, truncated, tod = corpseRead(m)
-                e = { model = m, part = corpsePart(m), lore = lore, user = user,
+                e = { key = key, model = m, part = corpsePart(m), lore = lore, user = user,
                       items = items, truncated = truncated, tod = tod }
                 CORPSE.entries[key] = e
+                CORPSE.order = nil          -- membership changed: rebuild the sampler cursor
                 -- Seeding: corpses already on the ground when you enable this are recorded but NOT
                 -- posted, so switching the toggle on in a busy server doesn't dump the backlog.
                 if CORPSE.seeded and CORPSE.Log and not CORPSE.seen[key] then
@@ -3486,6 +3491,7 @@ function CORPSE.scan()
         if not present[key] then
             if e.bundle then pcall(function() e.bundle.name:Remove() end) end
             CORPSE.entries[key] = nil
+            CORPSE.order = nil      -- membership changed: rebuild the sampler cursor
         end
     end
     local n = 0
@@ -3503,53 +3509,88 @@ function CORPSE.fetchAll()
     return n
 end
 
--- ESP: one Text per corpse, created lazily and hidden rather than removed (same discipline as the
--- player/titan renderer above — Drawing churn is what made the old build stutter).
-function CORPSE.draw()
-    local me
+-- SAMPLER (slow). Reads positions off the tree so the renderer never has to. This is the same
+-- discipline as the player/titan engine above, and for the same reason: reading .Parent/.Position
+-- per corpse per FRAME is a bridge round-trip per corpse per frame, which is precisely the traffic
+-- pattern that saturates the bridge and freezes the whole menu.
+-- Chunked so a graveyard of bodies can never produce one big synchronous burst.
+function CORPSE.sample()
     pcall(function()
         local ch = LocalPlayer.Character
         local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-        me = hrp and hrp.Position
+        CORPSE.me = hrp and hrp.Position or nil
     end)
+    local list = CORPSE.order
+    if not list or CORPSE.oi > #list then
+        list = {}
+        for _, e in pairs(CORPSE.entries) do list[#list + 1] = e end
+        CORPSE.order, CORPSE.oi = list, 1
+    end
+    local done = 0
+    while CORPSE.oi <= #list and done < 6 do          -- at most 6 corpses per tick
+        local e = list[CORPSE.oi]
+        CORPSE.oi = CORPSE.oi + 1
+        done = done + 1
+        if e and CORPSE.entries[e.key] then
+            -- Only re-resolve the part when we have none AND enough time has passed. Without the
+            -- retry gate a corpse whose part never resolves burns 5 lookups every single tick.
+            local ok = false
+            if e.part then ok = pcall(function() return e.part.Parent ~= nil end) and true or false end
+            if not e.part or not ok then
+                local nowc = os.clock()
+                if (e.nextPart or 0) <= nowc then
+                    e.nextPart = nowc + 3
+                    e.part = corpsePart(e.model)
+                end
+            end
+            if e.part then
+                local p; pcall(function() p = e.part.Position end)
+                e.pos = p
+            else
+                e.pos = nil
+            end
+        end
+    end
+end
+
+-- RENDERER (fast, PURE). Touches no game instances at all — only cached positions and one
+-- WorldToScreen per drawn corpse, capped to the nearest few.
+function CORPSE.draw()
+    local me = CORPSE.me
+    local drawn = 0
     for _, e in pairs(CORPSE.entries) do
         local shown = false
-        if CORPSE.ESP and me then
-            if not e.part or not e.part.Parent then e.part = corpsePart(e.model) end
-            local pos
-            if e.part then pcall(function() pos = e.part.Position end) end
-            if pos then
-                local d = (pos - me).Magnitude
-                if d <= CORPSE.MaxDist then
-                    local ok, screen, on = pcall(WorldToScreen, pos + Vector3.new(0, 3, 0))
-                    if ok and screen and on then
-                        if not e.bundle then
-                            local okB, b = pcall(function()
-                                local t = Drawing.new("Text")
-                                t.Size = 13; t.Center = true; t.Outline = true
-                                t.Font = Drawing.Fonts.System; t.Visible = false; t.ZIndex = 3
-                                t.Color = Color3.fromRGB(235, 90, 85)
-                                return { name = t }
-                            end)
-                            e.bundle = okB and b or nil
+        if CORPSE.ESP and me and e.pos and drawn < CORPSE.MaxDraw then
+            local d = (e.pos - me).Magnitude
+            if d <= CORPSE.MaxDist then
+                local ok, screen, on = pcall(WorldToScreen, e.pos + Vector3.new(0, 3, 0))
+                if ok and screen and on then
+                    if not e.bundle then
+                        local okB, b = pcall(function()
+                            local t = Drawing.new("Text")
+                            t.Size = 13; t.Center = true; t.Outline = true
+                            t.Font = Drawing.Fonts.System; t.Visible = false; t.ZIndex = 3
+                            t.Color = Color3.fromRGB(235, 90, 85)
+                            return { name = t }
+                        end)
+                        e.bundle = okB and b or nil
+                    end
+                    if e.bundle then
+                        local di = math.floor(d)
+                        -- rebuild the string only when the rounded distance changes, not every frame
+                        if e.bundle._d ~= di then
+                            e.bundle.name.Text = ((e.lore ~= "" and e.lore) or "?")
+                                .. "  [" .. ((e.user ~= "" and e.user) or "?") .. "]  " .. di .. "m"
+                            e.bundle._d = di
                         end
-                        if e.bundle then
-                            local label = ((e.lore ~= "" and e.lore) or "?")
-                                .. "  [" .. ((e.user ~= "" and e.user) or "?") .. "]"
-                                .. "  " .. math.floor(d) .. "m"
-                            if e.bundle._last ~= label then
-                                e.bundle.name.Text = label
-                                e.bundle._last = label
-                            end
-                            e.bundle.name.Position = Vector2.new(math.floor(screen.X + 0.5), math.floor(screen.Y + 0.5))
-                            e.bundle.name.Visible = true
-                            shown = true
-                        end
+                        e.bundle.name.Position = Vector2.new(math.floor(screen.X + 0.5), math.floor(screen.Y + 0.5))
+                        e.bundle.name.Visible = true
+                        shown, drawn = true, drawn + 1
                     end
                 end
             end
         end
-        if not shown and e.bundle then e.bundle.name.Visible = false end
+        if not shown and e.bundle and e.bundle.name.Visible then e.bundle.name.Visible = false end
     end
 end
 
@@ -3561,21 +3602,33 @@ function GUI.CorpseCleanup()
     end
 end
 
--- One loop for both halves. Discovery is slow (2s) because corpses are static; the draw pass is
--- 30Hz, which is plenty for a label that only follows a body lying on the ground.
-task.spawn(function()
-    local nextScan = 0
-    while GUI.Running do
-        pcall(function()
-            if CORPSE.ESP or CORPSE.Log then
-                local nowc = os.clock()
-                if nowc >= nextScan then nextScan = nowc + 2; CORPSE.scan() end
-                CORPSE.draw()
-            end
-        end)
-        task.wait(1 / 30)
-    end
-end)
+-- ⚠ GENERATION TOKEN — this is not optional. Re-running Verfall.lua creates a NEW GUI table, so
+-- an old loop's `GUI.Running` stays true forever and it never exits. Every re-run would stack
+-- another 30Hz loop, each closed over its OWN CORPSE table, so a loop from a run where you had
+-- ESP enabled keeps hammering the bridge and the CURRENT run's toggle cannot reach it. That is
+-- exactly the "it lags even when turned off, and eventually crashes" failure. The player/titan
+-- engine guards itself the same way with _G.__VERFALL_MATCHA_ESP.
+do
+    local gen = {}
+    _G.__VERFALL_CORPSE = gen
+    task.spawn(function()
+        local nextScan, nextSample = 0, 0
+        while GUI.Running and _G.__VERFALL_CORPSE == gen do
+            pcall(function()
+                if CORPSE.ESP or CORPSE.Log then
+                    local nowc = os.clock()
+                    if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
+                    if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
+                    CORPSE.draw()
+                end
+            end)
+            -- Idle cheaply while both switches are off: 4Hz is plenty to notice one being flipped.
+            task.wait((CORPSE.ESP or CORPSE.Log) and (1 / 30) or 0.25)
+        end
+        -- superseded or unloaded: drop our own Drawings so they can't linger on screen
+        pcall(function() if GUI.CorpseCleanup then GUI.CorpseCleanup() end end)
+    end)
+end
 
 -- ===== Tab: Main =====
 -- Each tab's UI is wrapped in do...end so its locals free between tabs, keeping the main
