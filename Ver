@@ -3302,14 +3302,23 @@ local CORPSE = {
 -- only persists when you explicitly save a profile — neither gives "type it once and it is there
 -- next launch". One short file, written once per edit, does.
 function CORPSE.loadWebhook()
-    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return false end
     local exists = false
     pcall(function() exists = isfile(CORPSE.Path) end)
-    if not exists then return end
+    if not exists then return false end
     local ok, raw = pcall(readfile, CORPSE.Path)
-    if ok and type(raw) == "string" then
-        CORPSE.Webhook = (raw:gsub("%s+", ""))     -- parenthesised: gsub's 2nd return must not leak
+    if not (ok and type(raw) == "string") then return false end
+    -- Tolerant BY DESIGN: this file is meant to be opened in Notepad and pasted into, so it ships
+    -- with an instructions header. Take the first line that actually looks like a URL; ignore blank
+    -- lines and both comment styles.
+    for line in (raw .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+        local s = (line:gsub("%s+", ""))          -- parenthesised: gsub's 2nd return must not leak
+        if s ~= "" and s:sub(1, 1) ~= "#" and s:sub(1, 2) ~= "--" and s:match("^https://") then
+            CORPSE.Webhook = s
+            return true
+        end
     end
+    return false
 end
 
 function CORPSE.saveWebhook()
@@ -4154,26 +4163,35 @@ local function whSet(url)
     end
 end
 
--- ⚠ The UI library has NO paste: it resolves getclipboard into a local and then never calls it
--- (verified — zero call sites). Typing a ~120-character webhook URL by hand is not reasonable, so
--- go to the executor directly.
-secWH:Button("Paste from Clipboard", function()
+-- ⚠ MATCHA HAS NO CLIPBOARD READ — pasting into the textbox does not work, and the UI library
+-- resolves getclipboard into a local it then never calls (zero call sites). Typing a ~120-character
+-- URL by hand is not reasonable, so the supported route is a TEXT FILE: Matcha's file sandbox is a
+-- real folder on disk (C:\matcha\workspace), so webhook.txt opens in Notepad like anything else.
+-- Paste there, save, press this. A clipboard function is still tried first in case a future build
+-- gains one.
+secWH:Button("Load from File", function()
     local txt
-    for _, name in ipairs({ "getclipboard", "getclipboardtext", "readclipboard", "Clipboard" }) do
+    for _, name in ipairs({ "getclipboard", "getclipboardtext", "readclipboard" }) do
         local fn = CORPSE.execFn(name)
         if fn then
             local ok, v = pcall(fn)
-            if ok and type(v) == "string" and v ~= "" then txt = v; break end
+            if ok and type(v) == "string" and v:match("^%s*https://") then txt = v; break end
         end
     end
-    if not txt then
-        Lib:Notify("Webhook", "no clipboard function in this build - type it into the box instead", 5, "warning")
+    if txt then
+        whSet(txt)
+        Lib:Notify("Webhook", "loaded from clipboard and saved", 3, "success")
         return
     end
-    whSet(txt)
-    local ok, why = CORPSE.webhookValid(CORPSE.Webhook)
-    Lib:Notify("Webhook", ok and "pasted and saved" or ("pasted, but " .. why), 3, ok and "success" or "warning")
-end):Tooltip("copy the URL in Discord, then press this")
+    if CORPSE.loadWebhook() then
+        whSet(CORPSE.Webhook)                    -- re-save (harmless) and refresh the textbox
+        local ok, why = CORPSE.webhookValid(CORPSE.Webhook)
+        Lib:Notify("Webhook", ok and "loaded from webhook.txt" or ("loaded, but " .. why),
+            4, ok and "success" or "warning")
+    else
+        Lib:Notify("Webhook", "no URL found - paste it into " .. CORPSE.Path .. " and save", 7, "warning")
+    end
+end):Tooltip("reads the URL out of webhook.txt in Matcha's workspace folder - paste it there with Notepad")
 
 secWH:Button("Test Webhook", function()
     task.spawn(function()
@@ -4198,6 +4216,9 @@ secWH:Label(function()
     if type(writefile) ~= "function" then return "URL: ok (id " .. id .. ") - NOT saved, no writefile" end
     return "URL: ok  (id " .. id .. ")  saved"
 end)
+-- Spell the path out. Matcha's sandbox is a real folder, so this is openable in Notepad — which is
+-- the only practical way to get a long URL in, given the executor cannot read the clipboard.
+secWH:Label(function() return "File: <matcha>\\workspace\\" .. CORPSE.Path:gsub("/", "\\") end)
 
 local secInfo = tabLogs:Section("Status", "Right", "Live")
 -- These read LIVE state. CORPSE.tracked and CORPSE.status are only written at the end of scan(),
