@@ -3261,7 +3261,11 @@ end)
 local CORPSE = {
     ESP        = false,        -- draw name/username over corpses
     Log        = false,        -- POST new corpses to the webhook
-    Webhook    = "https://discord.com/api/webhooks/1538981288600543273/2YmfRty0QHcNQWU1pOoUHEI3ruEphkouajbDP3hrMjpYI715ECxmjW33aWhI8xNoHnDK",
+    -- Set in the Logs tab, not here. Two hardcoded URLs were burned through in a day, so the URL
+    -- lives in the UI and persists to CORPSE.Path — swapping one is a paste, not a script edit.
+    Webhook    = "",
+    Path       = CONFIG_DIR .. "/webhook.txt",
+    saveAt     = nil,          -- debounce timer: written this many seconds after the last keystroke
     MaxDist    = 100000,
     MaxDraw    = 12,           -- hard cap on labels per frame, so a graveyard can't flood the renderer
     -- ⚠ DISCORD RATE SAFETY. A webhook may send ~30 messages/minute to a channel. The first version
@@ -3290,6 +3294,90 @@ local CORPSE = {
     tracked    = 0,
     status     = "idle",
 }
+
+-- WEBHOOK URL: PERSISTENCE, VALIDATION AND THE RAW POST
+-- Stored in its own tiny file rather than through the UI library's config manager. The library's
+-- autosave is deliberately pinned OFF for the whole session (it re-serialises the entire config and
+-- writefile()s it every 1.2s, which is a visible disk-write stutter), and its named-config manager
+-- only persists when you explicitly save a profile — neither gives "type it once and it is there
+-- next launch". One short file, written once per edit, does.
+function CORPSE.loadWebhook()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    local exists = false
+    pcall(function() exists = isfile(CORPSE.Path) end)
+    if not exists then return end
+    local ok, raw = pcall(readfile, CORPSE.Path)
+    if ok and type(raw) == "string" then
+        CORPSE.Webhook = (raw:gsub("%s+", ""))     -- parenthesised: gsub's 2nd return must not leak
+    end
+end
+
+function CORPSE.saveWebhook()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
+            makefolder(CONFIG_DIR)
+        end
+    end)
+    pcall(writefile, CORPSE.Path, tostring(CORPSE.Webhook or ""))
+end
+
+-- Shape check only — we cannot ask Discord whether a webhook is live without posting to it. The
+-- point is that a typo names itself in the Status panel: Matcha exposes no HTTP status code, so
+-- without this a malformed URL is indistinguishable from "the feature is broken".
+function CORPSE.webhookValid(u)
+    u = tostring(u or "")
+    if u == "" then return false, "no webhook set" end
+    if not u:match("^https://") then return false, "must start with https://" end
+    if not u:find("/api/webhooks/", 1, true) then return false, "not a webhook URL" end
+    if not u:match("/api/webhooks/(%d+)/[%w%-_]+") then return false, "missing id/token" end
+    return true, "ok"
+end
+
+-- Resolve an executor global that may live in getgenv(), _G or shared depending on the build.
+-- Mirrors how the UI library resolves iskeypressed/httppost/etc.
+function CORPSE.execFn(name)
+    local fn
+    pcall(function() local g = getgenv(); if g and type(g[name]) == "function" then fn = g[name] end end)
+    if type(fn) ~= "function" then pcall(function() if type(_G[name]) == "function" then fn = _G[name] end end) end
+    if type(fn) ~= "function" then pcall(function() if type(shared[name]) == "function" then fn = shared[name] end end) end
+    return fn
+end
+
+-- The raw POST, shared by the corpse feed and the Test button.
+-- ⚠ Matcha exposes NO HTTP status code (there is no RequestAsync), so a rejected post is otherwise
+-- COMPLETELY silent — no post, no error, nothing to debug. That is exactly how a deleted webhook
+-- looked like "the script is broken". Discord does return a JSON error body, so read it back:
+--   {"message": "Unknown Webhook", "code": 10015}
+-- Called directly, NOT via task.spawn: Matcha is single-threaded and cooperative, so task.spawn
+-- never made this async — it only threw the response away. Callers already rate-limit.
+function CORPSE.post(body)
+    local url = CORPSE.Webhook
+    local ok, why = CORPSE.webhookValid(url)
+    if not ok then CORPSE.lastError = why; return false end
+    local resp
+    pcall(function()
+        if type(httppost) == "function" then resp = httppost(url, body, "application/json")
+        else resp = game:HttpPost(url, body, "application/json") end
+    end)
+    if type(resp) == "string" and resp:find('"message"', 1, true) then
+        CORPSE.lastError = resp:match('"message"%s*:%s*"([^"]*)"') or "rejected"
+        return false
+    end
+    CORPSE.lastError = nil
+    CORPSE.sent = CORPSE.sent + 1
+    return true
+end
+
+-- One-off "does this URL actually work" probe, so a new webhook can be verified immediately
+-- instead of waiting for somebody to die.
+function CORPSE.testPost()
+    return CORPSE.post('{"embeds":[{"title":"Verfall connected",'
+        .. '"description":"Corpse log is wired up. Deaths will appear here.",'
+        .. '"color":5763719}]}')
+end
+
+CORPSE.loadWebhook()
 
 -- Tolerant JSON-ish scanner for the Inventory blob.
 --   {"Bandage":{"Amount":5,"HotbarSlot":2,"Metadata":[]},"Flint":{...},...}
@@ -3393,8 +3481,6 @@ end
 -- JSONEncode as unreliable on awkward tables. The shape here is fixed and tiny, so hand-rolling
 -- is both safer and shorter than defending against the encoder.
 local function corpseSend(e)
-    local url = CORPSE.Webhook
-    if type(url) ~= "string" or #url < 10 then return end
     local lines = {}
     for _, it in ipairs(e.items or {}) do
         lines[#lines + 1] = string.format("%-26s x%d", it.name, it.amount)
@@ -3434,23 +3520,7 @@ local function corpseSend(e)
         '"value":"',       corpseEsc(inv), '"}]',
         '}]}',
     })
-    -- Called directly, NOT via task.spawn. Matcha is single-threaded and cooperative, so task.spawn
-    -- never made this async anyway — it only threw away the response. work() already rate-limits us.
-    local resp
-    pcall(function()
-        if type(httppost) == "function" then resp = httppost(url, body, "application/json")
-        else resp = game:HttpPost(url, body, "application/json") end
-    end)
-    -- ⚠ Matcha exposes NO HTTP status code (there is no RequestAsync), so a rejected post used to be
-    -- COMPLETELY silent — no post, no error, nothing to debug. That is exactly how a deleted webhook
-    -- looked like "the script is broken". Discord does return a JSON error body, so read that and
-    -- surface it in the Status panel: {"message": "Unknown Webhook", "code": 10015}.
-    if type(resp) == "string" and resp:find('"message"', 1, true) then
-        CORPSE.lastError = resp:match('"message"%s*:%s*"([^"]*)"') or "rejected"
-    else
-        CORPSE.lastError = nil
-        CORPSE.sent = CORPSE.sent + 1
-    end
+    CORPSE.post(body)
 end
 
 -- Reads one corpse's attributes. Cheap: 3 GetAttribute calls, only on first sight.
@@ -3785,6 +3855,14 @@ do
             local busy = (#CORPSE.outbox > 0) or (#CORPSE.pending > 0)
             pcall(function()
                 local nowc = os.clock()
+                -- Debounced webhook save, OUTSIDE the active gate so it lands whether or not the
+                -- corpse features are on. Typing fires the textbox callback per keystroke; writing
+                -- the file per keystroke would be a disk write per character, which is the same
+                -- stutter the library's autosave was disabled for. One write, 1.5s after you stop.
+                if CORPSE.saveAt and nowc >= CORPSE.saveAt then
+                    CORPSE.saveAt = nil
+                    CORPSE.saveWebhook()
+                end
                 if active then
                     if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
                     if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
@@ -4035,7 +4113,14 @@ secCorpse:Toggle("Webhook Log", CORPSE.Log, function(v)
     if v then
         -- Re-seed so bodies already lying around don't all fire the moment you flip this on.
         CORPSE.seeded = false
-        toast("Corpse log armed - only NEW deaths post")
+        local ok, why = CORPSE.webhookValid(CORPSE.Webhook)
+        if ok then
+            toast("Corpse log armed - only NEW deaths post")
+        else
+            -- Arming with no destination used to be silent, which is half of why a dead webhook
+            -- looked like a broken script. Say so up front.
+            Lib:Notify("Corpse log", "armed, but the webhook is " .. why .. " - set it below", 6, "warning")
+        end
     end
 end):Tooltip("post each NEW corpse to the Discord webhook once. Bodies already on the ground when you enable this are recorded, not posted")
 secCorpse:Slider("ESP Distance", CORPSE.MaxDist, 100, 100, 100000, "", function(v)
@@ -4049,10 +4134,89 @@ secCorpse:Button("Queue All Corpses", function()
     end)
 end):Tooltip("ignore the seed rule and queue every body currently in the world. They go out one per second, because each POST blocks the game")
 
+-- WEBHOOK — typed in, not hardcoded, and remembered across launches (CORPSE.Path).
+local secWH = tabLogs:Section("Webhook", "Left", "Where deaths get posted")
+local whBox = secWH:Textbox("Webhook URL", CORPSE.Webhook, function(s)
+    CORPSE.Webhook   = (tostring(s or ""):gsub("%s+", ""))
+    CORPSE.lastError = nil                  -- a new URL clears a stale "Unknown Webhook"
+    CORPSE.saveAt    = os.clock() + 1.5     -- debounce; the loop does the actual write
+end):Tooltip("paste your Discord webhook URL here - it is saved to Verfall/webhook.txt automatically")
+
+local function whSet(url)
+    CORPSE.Webhook   = (tostring(url or ""):gsub("%s+", ""))
+    CORPSE.lastError = nil
+    CORPSE.saveWebhook()                     -- button presses save immediately, no debounce needed
+    if whBox then
+        -- the fork exposes :Set; fall back to :SetValue on the upstream lib
+        if not pcall(function() whBox:Set(CORPSE.Webhook) end) then
+            pcall(function() whBox:SetValue(CORPSE.Webhook) end)
+        end
+    end
+end
+
+-- ⚠ The UI library has NO paste: it resolves getclipboard into a local and then never calls it
+-- (verified — zero call sites). Typing a ~120-character webhook URL by hand is not reasonable, so
+-- go to the executor directly.
+secWH:Button("Paste from Clipboard", function()
+    local txt
+    for _, name in ipairs({ "getclipboard", "getclipboardtext", "readclipboard", "Clipboard" }) do
+        local fn = CORPSE.execFn(name)
+        if fn then
+            local ok, v = pcall(fn)
+            if ok and type(v) == "string" and v ~= "" then txt = v; break end
+        end
+    end
+    if not txt then
+        Lib:Notify("Webhook", "no clipboard function in this build - type it into the box instead", 5, "warning")
+        return
+    end
+    whSet(txt)
+    local ok, why = CORPSE.webhookValid(CORPSE.Webhook)
+    Lib:Notify("Webhook", ok and "pasted and saved" or ("pasted, but " .. why), 3, ok and "success" or "warning")
+end):Tooltip("copy the URL in Discord, then press this")
+
+secWH:Button("Test Webhook", function()
+    task.spawn(function()
+        local ok, why = CORPSE.webhookValid(CORPSE.Webhook)
+        if not ok then Lib:Notify("Webhook", "invalid: " .. why, 4, "warning"); return end
+        if CORPSE.testPost() then
+            Lib:Notify("Webhook", "sent - check the channel", 4, "success")
+        else
+            -- The single most useful message this menu can show. "Unknown Webhook" means Discord
+            -- deleted it; make a new one and paste it in.
+            Lib:Notify("Webhook", "Discord rejected it: " .. tostring(CORPSE.lastError or "?"), 6, "warning")
+        end
+    end)
+end):Tooltip("post one test embed so you can confirm a new webhook works without waiting for a death")
+
+secWH:Label(function()
+    local ok, why = CORPSE.webhookValid(CORPSE.Webhook)
+    if not ok then return "URL: " .. why end
+    local id = CORPSE.Webhook:match("/api/webhooks/(%d+)/") or "?"
+    -- Don't claim it persists if the executor can't write files — otherwise it silently forgets
+    -- the URL on the next launch and looks like the setting never took.
+    if type(writefile) ~= "function" then return "URL: ok (id " .. id .. ") - NOT saved, no writefile" end
+    return "URL: ok  (id " .. id .. ")  saved"
+end)
+
 local secInfo = tabLogs:Section("Status", "Right", "Live")
-secInfo:Label(function() return "Tracked:  " .. (CORPSE.tracked or 0) end)
-secInfo:Label(function() return "Posted:   " .. (CORPSE.sent or 0) .. "   queued: " .. #CORPSE.outbox end)
-secInfo:Label(function() return tostring(CORPSE.status or "idle") end)
+-- These read LIVE state. CORPSE.tracked and CORPSE.status are only written at the end of scan(),
+-- and scan() does not run while both toggles are off — so reading those fields left the panel
+-- frozen on whatever the last scan saw ("0 tracked ... 6 queued" long after the queue had drained),
+-- which is worse than useless when the panel is what you are using to diagnose a problem.
+secInfo:Label(function()
+    local n = 0
+    for _ in pairs(CORPSE.entries) do n = n + 1 end
+    return "Tracked:  " .. n
+end)
+secInfo:Label(function()
+    return "Posted:   " .. (CORPSE.sent or 0) .. "   outbox: " .. #CORPSE.outbox
+        .. "   pending: " .. #CORPSE.pending
+end)
+secInfo:Label(function()
+    if not (CORPSE.ESP or CORPSE.Log) then return "idle - both switches off" end
+    return tostring(CORPSE.status or "idle")
+end)
 -- Per-phase cost, so a stall names itself instead of needing another round of guesswork.
 secInfo:Label(function()
     return string.format("scan %.0fms  read %.0fms  post %.0fms",
