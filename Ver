@@ -3261,7 +3261,7 @@ end)
 local CORPSE = {
     ESP        = false,        -- draw name/username over corpses
     Log        = false,        -- POST new corpses to the webhook
-    Webhook    = "https://discord.com/api/webhooks/1538808588343058593/HpfS6OmXiRgaNZoxgQxiso5gBXCj6Wz8GQwEHsBc5eBUSa9ETwXSLUY9Yr-wBOb_hee4",
+    Webhook    = "https://discord.com/api/webhooks/1538981288600543273/2YmfRty0QHcNQWU1pOoUHEI3ruEphkouajbDP3hrMjpYI715ECxmjW33aWhI8xNoHnDK",
     MaxDist    = 100000,
     MaxDraw    = 12,           -- hard cap on labels per frame, so a graveyard can't flood the renderer
     me         = nil,          -- our own position, sampled on the slow loop (never per frame)
