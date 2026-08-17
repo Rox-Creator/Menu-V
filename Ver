@@ -3268,6 +3268,11 @@ local CORPSE = {
     order      = nil,          -- round-robin cursor for the chunked position sampler
     oi         = 1,
     entries    = {},           -- [key] = { key, model, part, lore, user, items, truncated, pos, bundle }
+    pending    = {},           -- corpses discovered but not yet read (expensive work, 1 per tick)
+    queued     = {},           -- [key] = true while it sits in `pending`, so it is queued once
+    outbox     = {},           -- webhook posts waiting to go out, at most 1/sec (HTTP BLOCKS)
+    nextPost   = 0,
+    scanMs     = 0, workMs = 0, postMs = 0,   -- per-phase cost, surfaced in the Status panel
     seen       = {},           -- [key] = true, so each corpse is posted at most once
     seeded     = false,        -- first scan only records; it never floods the channel on enable
     sent       = 0,
@@ -3453,9 +3458,17 @@ local function corpsePart(m)
     return nil
 end
 
--- Slow discovery pass. Corpses are few (single digits), so one folder read per tick is fine —
--- but it still only runs when a Logs feature is on, and it never touches parts it already knows.
+-- DISCOVERY (cheap). Lists the folder and notes which corpses exist. It deliberately does NOT
+-- read attributes here — that is the expensive half and it is deferred to CORPSE.work().
+--
+-- ⚠ My original version did the whole job in this one pass, on the assumption that corpses are
+-- "few (single digits)". That was measured in an empty test server and is wrong in a live one.
+-- Per NEW corpse it did 4x GetAttribute (the SLOWEST Matcha call, 336-511us each) plus up to 5x
+-- FindFirstChild, and then a webhook POST — all synchronously, in one tick. With a pile of fresh
+-- bodies that is hundreds of round-trips plus blocking HTTP on a single cooperative thread, i.e.
+-- the menu stopping dead on the scan cadence.
 function CORPSE.scan()
+    local t0 = os.clock()
     local folder = Workspace:FindFirstChild("World")
     folder = folder and folder:FindFirstChild("Corpses")
     if not folder then CORPSE.status = "no Corpses folder"; return end
@@ -3464,25 +3477,16 @@ function CORPSE.scan()
     if not kids then return end
     local present = {}
     for _, m in ipairs(kids) do
-        local key
-        pcall(function() key = tostring(m.Address) end)
+        local ad
+        pcall(function() ad = tonumber(m.Address) end)
+        -- %.0f, never tostring(): a big address stringifies into scientific notation, which
+        -- collides distinct corpses onto one key and makes entries churn every scan.
+        local key = ad and string.format("%.0f", ad) or nil
         if key then
             present[key] = true
-            local e = CORPSE.entries[key]
-            if not e then
-                local lore, user, items, truncated, tod = corpseRead(m)
-                e = { key = key, model = m, part = corpsePart(m), lore = lore, user = user,
-                      items = items, truncated = truncated, tod = tod }
-                CORPSE.entries[key] = e
-                CORPSE.order = nil          -- membership changed: rebuild the sampler cursor
-                -- Seeding: corpses already on the ground when you enable this are recorded but NOT
-                -- posted, so switching the toggle on in a busy server doesn't dump the backlog.
-                if CORPSE.seeded and CORPSE.Log and not CORPSE.seen[key] then
-                    CORPSE.seen[key] = true
-                    corpseSend(e)
-                else
-                    CORPSE.seen[key] = true
-                end
+            if not CORPSE.entries[key] and not CORPSE.queued[key] then
+                CORPSE.queued[key] = true
+                CORPSE.pending[#CORPSE.pending + 1] = { key = key, model = m }
             end
         end
     end
@@ -3498,14 +3502,59 @@ function CORPSE.scan()
     for _ in pairs(CORPSE.entries) do n = n + 1 end
     CORPSE.tracked = n
     CORPSE.seeded = true
-    CORPSE.status = n .. " tracked, " .. CORPSE.sent .. " sent"
+    CORPSE.scanMs = (os.clock() - t0) * 1000
+    CORPSE.status = n .. " tracked, " .. CORPSE.sent .. " sent, " .. #CORPSE.pending .. " queued"
 end
 
--- Manual dump of everything on the ground right now, ignoring the seed rule.
+-- THE EXPENSIVE HALF, BUDGETED. Runs on every loop tick but does at most ONE new corpse and at
+-- most ONE webhook POST, so neither can ever pile up into a single blocking burst.
+function CORPSE.work(nowc)
+    -- 1) adopt one queued corpse (4 GetAttribute + up to 5 FindFirstChild)
+    if #CORPSE.pending > 0 then
+        local t0 = os.clock()
+        local job = table.remove(CORPSE.pending, 1)
+        CORPSE.queued[job.key] = nil
+        local m = job.model
+        local alive = false
+        pcall(function() alive = m.Parent ~= nil end)
+        if alive then
+            local lore, user, items, truncated, tod = corpseRead(m)
+            local e = { key = job.key, model = m, part = corpsePart(m), lore = lore, user = user,
+                        items = items, truncated = truncated, tod = tod }
+            CORPSE.entries[job.key] = e
+            CORPSE.order = nil
+            -- Seeding: bodies already on the ground when you enable this are recorded, not posted.
+            if CORPSE.seeded and CORPSE.Log and not CORPSE.seen[job.key] then
+                CORPSE.outbox[#CORPSE.outbox + 1] = e
+            end
+            CORPSE.seen[job.key] = true
+        end
+        CORPSE.workMs = (os.clock() - t0) * 1000
+        return                                  -- one job per tick, never two
+    end
+    -- 2) send at most one webhook, and never more often than once a second.
+    -- httppost is a SYNCHRONOUS bridge op — task.spawn does not make it async, because Matcha is
+    -- single-threaded and cooperative. Every POST blocks the whole VM for its round-trip, so the
+    -- only defence is to make sure they can never happen back-to-back.
+    if #CORPSE.outbox > 0 and nowc >= (CORPSE.nextPost or 0) then
+        CORPSE.nextPost = nowc + 1
+        local e = table.remove(CORPSE.outbox, 1)
+        local t0 = os.clock()
+        corpseSend(e)
+        CORPSE.postMs = (os.clock() - t0) * 1000
+    end
+end
+
+-- Manual dump of everything on the ground right now, ignoring the seed rule. QUEUES them rather
+-- than sending inline: posting N corpses in a loop would be N blocking HTTP calls back-to-back,
+-- which freezes the game for as long as that takes. The outbox drains at 1/sec.
 function CORPSE.fetchAll()
     CORPSE.scan()
     local n = 0
-    for _, e in pairs(CORPSE.entries) do corpseSend(e); n = n + 1 end
+    for _, e in pairs(CORPSE.entries) do
+        CORPSE.outbox[#CORPSE.outbox + 1] = e
+        n = n + 1
+    end
     return n
 end
 
@@ -3619,6 +3668,7 @@ do
                     local nowc = os.clock()
                     if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
                     if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
+                    CORPSE.work(nowc)      -- one queued corpse OR one webhook, never a burst
                     CORPSE.draw()
                 end
             end)
@@ -3862,17 +3912,22 @@ secCorpse:Slider("ESP Distance", CORPSE.MaxDist, 100, 100, 100000, "", function(
     CORPSE.MaxDist = tonumber(v) or CORPSE.MaxDist
 end)
 
-secCorpse:Button("Post All Corpses Now", function()
+secCorpse:Button("Queue All Corpses", function()
     task.spawn(function()
         local n = CORPSE.fetchAll()
-        Lib:Notify("Corpses", "Posted " .. n .. " corpse(s) to the webhook", 3, "success")
+        Lib:Notify("Corpses", "Queued " .. n .. " corpse(s) - sending 1/sec", 3, "success")
     end)
-end):Tooltip("ignore the seed rule and dump every body currently in the world")
+end):Tooltip("ignore the seed rule and queue every body currently in the world. They go out one per second, because each POST blocks the game")
 
 local secInfo = tabLogs:Section("Status", "Right", "Live")
 secInfo:Label(function() return "Tracked:  " .. (CORPSE.tracked or 0) end)
-secInfo:Label(function() return "Posted:   " .. (CORPSE.sent or 0) end)
+secInfo:Label(function() return "Posted:   " .. (CORPSE.sent or 0) .. "   queued: " .. #CORPSE.outbox end)
 secInfo:Label(function() return tostring(CORPSE.status or "idle") end)
+-- Per-phase cost, so a stall names itself instead of needing another round of guesswork.
+secInfo:Label(function()
+    return string.format("scan %.0fms  read %.0fms  post %.0fms",
+        CORPSE.scanMs or 0, CORPSE.workMs or 0, CORPSE.postMs or 0)
+end)
 secInfo:Label(function()
     -- Worth surfacing: the inventory read is capped by the executor, not by us.
     return "Inventory reads cap at 255 chars"
