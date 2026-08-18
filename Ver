@@ -144,6 +144,11 @@ local BuffsState = {
     ActionSpeed        = { target = 2,    default = 0,    type = "bonus", max = 100000 }, -- faster swings/reloads (free Quick Hands)
     -- Weapon buff (manual-aim range/accuracy, confirmed working 2026-06-22)
     FirearmRange       = { target = 100,  default = 0,    type = "bonus", max = 100000 }, -- extended musket range + accuracy (you still aim)
+    -- Spread multiplier term, NOT a bonus: GunClass computes
+    --   GetSpreadModifier() = 1 + GetInfo("FirearmSpread")
+    --   GetSpread()         = MaxSpread * velocityFactor * GetSpreadModifier()
+    -- so -1 multiplies spread by ZERO. Stored as the raw ratio; the slider works in percent.
+    FirearmSpread      = { target = 0,    default = 0,    type = "ratio", max = 100000 },
 }
 
 -- Format a number compactly: trim trailing zeros, show decimals if < 1
@@ -1950,7 +1955,7 @@ end
 -- name-mapping table is needed. Order only matters for the "Pin All" toast.
 local AUTOPIN_KEYS = {
     "HookRange", "GasConservation", "ReloadSpeed", "OdmVeloCap", "RunSpeed",
-    "FirearmRange", "OdmHookVeloGain", "OdmPassiveVeloGain", "ActionSpeed",
+    "FirearmRange", "OdmHookVeloGain", "OdmPassiveVeloGain", "ActionSpeed", "FirearmSpread",
 }
 
 -- Write every buff once. Returns how many landed (0 = not in a round yet).
@@ -2709,6 +2714,7 @@ resetConfig = function()
     BuffsState.OdmPassiveVeloGain.target = 10
     BuffsState.ActionSpeed.target        = 2
     BuffsState.FirearmRange.target       = 100
+    BuffsState.FirearmSpread.target      = 0
     pcall(restoreHorseWatch)
     if Horse.SnapTaken then restoreHorse() end
     Horse.MaxSpeed = 65
@@ -3582,6 +3588,39 @@ do
 local tabChar = window:Tab("Character", "user")
 
 local secAck = tabChar:Section("Ackerman", "Left", "Type Values, Then Pin")
+
+-- FIREARM SPREAD — applies LIVE, no Pin press needed, and sits at the top of the panel so it is
+-- visible without scrolling.
+-- Proven client-side consumer, read straight out of the decompiled
+-- ClientFramework.Classes.GunClass rather than assumed:
+--     GetSpreadModifier() : base = 1, or 2 without the "Basic FirearmsTraining" talent
+--                           returns base + GetInfo("FirearmSpread")
+--     GetSpread()         : returns MaxSpread * velocityFactor * GetSpreadModifier()
+-- It is a MULTIPLIER TERM, not one of the additive bonuses the textboxes below use, so it is exposed
+-- in percent. ⚠ THE RANGE GOES TO -200% ON PURPOSE: the base is 2 rather than 1 for anyone without
+-- Basic FirearmsTraining, so -100% only cancels the talent penalty for them and -200% is what
+-- actually reaches zero. Positive values widen spread.
+--
+-- Two things in that same file decide whether the slider appears to do ANYTHING:
+--   * GetSpread returns 0 outright when HRP velocity <= 1 — standing still is already pinpoint, so
+--     the slider can only be judged while MOVING.
+--   * ApplySpread returns the direction unchanged when distance <= Range/2 — no spread is applied
+--     at close range either.
+-- Also note velocityFactor normalises by (20 + GetInfo("RunSpeed")), so the RunSpeed pin already
+-- tightens gun accuracy as a side effect.
+local fsSlider
+fsSlider = secAck:Slider("Firearm Spread",
+    math.floor(((BuffsState.FirearmSpread and BuffsState.FirearmSpread.target) or 0) * 100 + 0.5),
+    5, -200, 300, "%", function(v)
+        local pct = tonumber(v) or 0
+        local b = BuffsState.FirearmSpread
+        if b then b.target = pct / 100 end
+        -- One SetAttribute, applied immediately so the change is testable without pressing Pin.
+        -- Auto Pin also carries it now, which is what keeps it applied after a respawn or gear swap.
+        pcall(pinAttrOnce, "FirearmSpread", "FirearmSpread")
+    end)
+fsSlider:Tooltip("-100% = zero spread. Positive widens it - the fastest way to PROVE it works is to set +300% and watch shots scatter")
+secAck:Divider("Pin Values")
 local ACK_BUFFS = {
     { "HookRange", "Hook Range" },          { "GasConservation", "Gas Conservation" },
     { "ReloadSpeed", "Reload Speed" },      { "OdmVeloCap", "ODM Velo Cap" },
@@ -3662,6 +3701,11 @@ secAck:Button("Reset Defaults", function()
             ackSetBoxText(key, fmtNum(def))
         end
     end
+    -- Spread is a slider, not one of the ACK_BUFFS textboxes, so reset it explicitly — otherwise
+    -- the control would keep showing a value that no longer matches what is pinned.
+    if BuffsState.FirearmSpread then BuffsState.FirearmSpread.target = 0 end
+    if fsSlider then pcall(function() fsSlider:Set(0) end) end
+    pcall(pinAttrOnce, "FirearmSpread", "FirearmSpread")
     Lib:Notify("Ackerman", "Reset to defaults - press each Pin to apply", 3, "success")
 end):Tooltip("restore the default numbers (shown on each box)")
 
