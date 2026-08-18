@@ -1883,6 +1883,149 @@ end
 
 
 -- ============================================================
+-- TITAN PRESETS — named sets of the anti-hitbox toggles
+-- ============================================================
+-- A preset is just a set of the eight No-* flags. The master switch applies the selected set when
+-- turned ON and clears every flag when turned OFF, so it doubles as a panic-off. Persisted to its
+-- own file, same approach as the webhook URL and the Velo HUD position.
+local TITAN_FLAGS = { "NoGrab", "NoStomp", "NoBite", "NoKick", "NoPunch", "NoSwing", "NoAllHitboxes", "NoAttack" }
+local TPRESET = {
+    Path     = CONFIG_DIR .. "/titanpresets.txt",
+    list     = {},        -- ordered: { { name = "boss", flags = { NoGrab = true, ... } }, ... }
+    active   = nil,       -- name of the selected preset
+    on       = false,     -- master switch
+    applying = false,     -- see setFlags(): suppresses the per-toggle titan sync
+    ctl      = {},        -- [flagName] = the toggle's control handle, so the menu can be resynced
+    pending  = "",        -- contents of the Name textbox
+    saveAt   = nil,       -- debounced write, serviced by the always-running corpse loop
+    dd       = nil,       -- the Active Preset dropdown handle
+}
+
+function TPRESET.find(name)
+    for i, p in ipairs(TPRESET.list) do
+        if p.name == name then return i, p end
+    end
+end
+
+function TPRESET.names()
+    local out = {}
+    for i, p in ipairs(TPRESET.list) do out[i] = p.name end
+    return out
+end
+
+-- Snapshot the toggles as they are right now.
+function TPRESET.capture()
+    local f = {}
+    for _, k in ipairs(TITAN_FLAGS) do f[k] = Features[k] == true end
+    return f
+end
+
+function TPRESET.count(flags)
+    local n = 0
+    for _, k in ipairs(TITAN_FLAGS) do if flags[k] then n = n + 1 end end
+    return n
+end
+
+-- Write a flag set into Features, resync the menu, and run ONE titan pass.
+function TPRESET.setFlags(flags)
+    -- ⚠ THE GUARD IS LOAD-BEARING. The library's control:Set() calls cX(item, value, true), and the
+    -- `true` means "fire the callback" — so resyncing eight toggles would otherwise run the whole
+    -- titan re-sync eight times over. Each toggle callback checks this flag and skips its own sync.
+    TPRESET.applying = true
+    for _, k in ipairs(TITAN_FLAGS) do
+        local want = flags[k] == true
+        Features[k] = want
+        local c = TPRESET.ctl[k]
+        if c then pcall(function() c:Set(want) end) end
+    end
+    TPRESET.applying = false
+    -- ONE pass covers all eight: applyNoAttack and restoreNoAttack both call syncTitans(), which is
+    -- exactly what refreshAntiTitan does, and No Attack additionally owns the IsInvisible pin.
+    if Features.NoAttack then applyNoAttack() else restoreNoAttack() end
+end
+
+function TPRESET.apply(name)
+    local _, p = TPRESET.find(name)
+    if not p then return false end
+    TPRESET.setFlags(p.flags)
+    return true
+end
+
+function TPRESET.clearAll()
+    TPRESET.setFlags({})     -- empty set = every No-* flag off
+end
+
+function TPRESET.saveTo(name)
+    name = tostring(name or ""):gsub("[|\r\n]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then return nil end
+    local _, p = TPRESET.find(name)
+    if p then
+        p.flags = TPRESET.capture()
+    else
+        TPRESET.list[#TPRESET.list + 1] = { name = name, flags = TPRESET.capture() }
+    end
+    TPRESET.active = name
+    TPRESET.saveAt = os.clock() + 0.5
+    return name
+end
+
+function TPRESET.delete(name)
+    local i = TPRESET.find(name)
+    if not i then return false end
+    table.remove(TPRESET.list, i)
+    if TPRESET.active == name then
+        TPRESET.active = TPRESET.list[1] and TPRESET.list[1].name or nil
+    end
+    TPRESET.saveAt = os.clock() + 0.5
+    return true
+end
+
+function TPRESET.load()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    local exists = false
+    pcall(function() exists = isfile(TPRESET.Path) end)
+    if not exists then return end
+    local ok, raw = pcall(readfile, TPRESET.Path)
+    if not (ok and type(raw) == "string") then return end
+    for line in (raw .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+        local k, v = line:match("^(%w+)=(.*)$")
+        if k == "p" then
+            -- p=<name>|<comma separated flags>
+            local nm, csv = v:match("^([^|]*)|(.*)$")
+            if nm and nm ~= "" then
+                local flags = {}
+                for f in csv:gmatch("[^,]+") do flags[f] = true end
+                TPRESET.list[#TPRESET.list + 1] = { name = nm, flags = flags }
+            end
+        elseif k == "active" then
+            TPRESET.active = (v ~= "" and v) or nil
+        elseif k == "on" then
+            TPRESET.on = (v == "1")
+        end
+    end
+    if TPRESET.active and not TPRESET.find(TPRESET.active) then TPRESET.active = nil end
+end
+
+function TPRESET.save()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
+            makefolder(CONFIG_DIR)
+        end
+    end)
+    local out = { "on=" .. (TPRESET.on and "1" or "0"), "active=" .. tostring(TPRESET.active or "") }
+    for _, p in ipairs(TPRESET.list) do
+        local set = {}
+        for _, k in ipairs(TITAN_FLAGS) do if p.flags[k] then set[#set + 1] = k end end
+        out[#out + 1] = "p=" .. p.name .. "|" .. table.concat(set, ",")
+    end
+    pcall(writefile, TPRESET.Path, table.concat(out, "\n"))
+end
+
+TPRESET.load()
+
+
+-- ============================================================
 -- MATCHA ESP ENGINE — a pure renderer over the world registry
 -- ============================================================
 -- This block no longer touches the game tree AT ALL. Reg samples positions/attributes on its own
@@ -2286,6 +2429,9 @@ local function UnloadScript()
     -- remove them, so they would hang on screen after unload. Called through GUI because the corpse
     -- engine is declared further down the file than this function.
     pcall(function() if GUI.CorpseFlushWebhook then GUI.CorpseFlushWebhook() end end)
+    -- Flush a preset edit that has not hit its debounce yet (GUI.Running = false below stops the
+    -- loop that would otherwise write it).
+    pcall(function() if TPRESET.saveAt then TPRESET.saveAt = nil; TPRESET.save() end end)
     pcall(function() if GUI.CorpseCleanup then GUI.CorpseCleanup() end end)
     -- Tear down the INS-ui window (cleanup closure is installed at startup)
     pcall(function() if _G.MatchaCleanup then _G.MatchaCleanup() end end)
@@ -3072,6 +3218,10 @@ do
                     VELO.saveAt = nil
                     VELO.save()
                 end
+                if TPRESET.saveAt and nowc >= TPRESET.saveAt then
+                    TPRESET.saveAt = nil
+                    TPRESET.save()
+                end
                 if active then
                     if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
                     if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
@@ -3247,36 +3397,127 @@ secAck:Button("Reset Defaults", function()
 end):Tooltip("restore the default numbers (shown on each box)")
 
 local secTitan = tabChar:Section("Titans", "Right", "Anti-Hitbox + Weakpoints")
-secTitan:Toggle("No Grab", Features.NoGrab, function(v) Features.NoGrab = v; refreshAntiTitan() end)
-secTitan:Toggle("No Stomp", Features.NoStomp, function(v) Features.NoStomp = v; refreshAntiTitan() end)
-secTitan:Toggle("No Bite", Features.NoBite, function(v) Features.NoBite = v; refreshAntiTitan() end)
-secTitan:Toggle("No Kick", Features.NoKick, function(v) Features.NoKick = v; refreshAntiTitan() end)
-    :Tooltip("normal titans have a Kick hitbox too")
-secTitan:Toggle("No Punch", Features.NoPunch, function(v) Features.NoPunch = v; refreshAntiTitan() end)
-    :Tooltip("shifter/Ogre punches + heavy attack")
-secTitan:Toggle("No Swing", Features.NoSwing, function(v) Features.NoSwing = v; refreshAntiTitan() end)
-    :Tooltip("shifter/Ogre swing + eat hitboxes")
-secTitan:Toggle("No Attack", Features.NoAttack, function(v)
-    Features.NoAttack = v
+-- Every one of these stores its handle in TPRESET.ctl so a preset can resync the menu, and every
+-- one skips its own titan sync while a preset is being applied (TPRESET.setFlags does a single
+-- pass at the end instead of one per toggle).
+local function titanToggle(label, flag, tip, applyFn)
+    local h = secTitan:Toggle(label, Features[flag], function(v)
+        Features[flag] = v
+        if TPRESET.applying then return end
+        if applyFn then applyFn(v) else refreshAntiTitan() end
+    end)
+    if tip then h:Tooltip(tip) end
+    TPRESET.ctl[flag] = h
+    return h
+end
+titanToggle("No Grab", "NoGrab")
+titanToggle("No Stomp", "NoStomp")
+titanToggle("No Bite", "NoBite")
+titanToggle("No Kick", "NoKick", "normal titans have a Kick hitbox too")
+titanToggle("No Punch", "NoPunch", "shifter/Ogre punches + heavy attack")
+titanToggle("No Swing", "NoSwing", "shifter/Ogre swing + eat hitboxes")
+titanToggle("No Attack", "NoAttack", nil, function(v)
     if v then applyNoAttack() else restoreNoAttack() end
 end)
 secTitan:Divider("Staff Bosses")
-secTitan:Toggle("Disable ALL Hitboxes", Features.NoAllHitboxes, function(v)
-    Features.NoAllHitboxes = v; refreshAntiTitan()
-end):Tooltip("kill every hitbox part whatever it's named - the one that works on staff bosses")
+titanToggle("Disable ALL Hitboxes", "NoAllHitboxes",
+    "kill every hitbox part whatever it's named - the one that works on staff bosses")
 secTitan:Toggle("Scan Workspace Bosses", Features.BossScan, function(v)
     Features.BossScan = v
     Reg.bossAt = 0            -- force an immediate rescan either way
     refreshAntiTitan()
 end):Tooltip("register shifters parented at the Workspace root (Ogre, Abnormal) - they are NOT in World.Titans")
 secTitan:Divider("Hitbox Expander")
+-- The keybind is handled entirely by the library: with no keybind-specific callback it routes
+-- through the control's own setter, which fires THIS callback — so applyNapeFollow/restoreNapeFollow
+-- run on the keypress exactly as if you had clicked the toggle. Right-click the bind in the menu to
+-- switch it between Hold / Toggle / Always; Hold is worth trying, since the expander only matters
+-- during a swing.
 secTitan:Toggle("Hitbox Expander", Features.NapeFollow, function(v)
     Features.NapeFollow = v
     if v then applyNapeFollow() else restoreNapeFollow() end
-end):Tooltip("extend the nape/eye weakpoints toward you (swords)")
+end):AddKeybind("g", "Toggle"):Tooltip("extend the nape/eye weakpoints toward you (swords) - bound to G, right-click the bind for Hold mode")
 secTitan:Toggle("Extend Nape", Features.ExtendNape, function(v) Features.ExtendNape = v end)
 secTitan:Toggle("Extend Eyes", Features.ExtendEye, function(v) Features.ExtendEye = v end)
 secTitan:Slider("Range", NapeFollowRange, 1, 30, 900, "", function(v) NapeFollowRange = v end)
+
+-- ===== Titan presets =====
+-- Name a set of the No-* toggles, save it, and flip the whole set with one switch (or its bind).
+local secTP = tabChar:Section("Titan Presets", "Left", "Saved Anti-Hitbox Sets")
+
+local function tpRefreshDropdown()
+    if not TPRESET.dd then return end
+    pcall(function() TPRESET.dd:UpdateChoices(TPRESET.names()) end)
+    pcall(function() TPRESET.dd:Set(TPRESET.active or "") end)
+end
+
+TPRESET.dd = secTP:Dropdown("Active Preset", TPRESET.active or "", TPRESET.names(), false, function(v)
+    -- Single-select dropdowns still hand back a TABLE (the library wraps every value via a2()).
+    local pick = v
+    if type(pick) == "table" then pick = pick[1] end
+    pick = tostring(pick or "")
+    TPRESET.active = (pick ~= "" and pick) or nil
+    TPRESET.saveAt = os.clock() + 0.5
+    -- Switching preset while the master switch is ON swaps the live set immediately.
+    if TPRESET.on and TPRESET.active then TPRESET.apply(TPRESET.active) end
+end):Tooltip("which saved set the switch below applies")
+
+secTP:Textbox("Name", "", function(s) TPRESET.pending = tostring(s or "") end)
+    :Tooltip("type a name here, then press Save Current")
+
+secTP:Button("Save Current", function()
+    -- Name box wins; falling back to the selected preset makes this an in-place overwrite.
+    local name = TPRESET.pending
+    if name == nil or name:gsub("%s", "") == "" then name = TPRESET.active end
+    local saved = TPRESET.saveTo(name)
+    if not saved then
+        Lib:Notify("Titan Presets", "type a name first", 4, "warning")
+        return
+    end
+    tpRefreshDropdown()
+    Lib:Notify("Titan Presets", "saved '" .. saved .. "' (" .. TPRESET.count(TPRESET.capture()) .. " toggles)", 3, "success")
+end):Tooltip("store the No-* toggles exactly as they are right now, under the typed name")
+
+secTP:Button("Delete", function()
+    if not TPRESET.active then Lib:Notify("Titan Presets", "nothing selected", 3, "warning"); return end
+    local gone = TPRESET.active
+    if TPRESET.delete(gone) then
+        tpRefreshDropdown()
+        Lib:Notify("Titan Presets", "deleted '" .. gone .. "'", 3, "success")
+    end
+end):SetRisk()
+
+secTP:Toggle("Preset Active", TPRESET.on, function(v)
+    TPRESET.on = v
+    TPRESET.saveAt = os.clock() + 0.5
+    if v then
+        if TPRESET.active and TPRESET.apply(TPRESET.active) then
+            Lib:Notify("Titan Presets", "applied '" .. TPRESET.active .. "'", 2, "success")
+        else
+            Lib:Notify("Titan Presets", "no preset selected - save one first", 4, "warning")
+        end
+    else
+        -- OFF is a deliberate panic-off: every No-* toggle clears, whatever was on before.
+        TPRESET.clearAll()
+    end
+end):AddKeybind("v", "Toggle")
+   :Tooltip("ON applies the selected preset, OFF clears EVERY No-* toggle - bound to V")
+
+secTP:Label(function()
+    if #TPRESET.list == 0 then return "no presets saved yet" end
+    local _, p = TPRESET.find(TPRESET.active or "")
+    if not p then return #TPRESET.list .. " saved   (none selected)" end
+    return (TPRESET.on and "ON  " or "off ") .. p.name .. "  -  " .. TPRESET.count(p.flags) .. " toggles"
+end)
+secTP:Label(function()
+    local _, p = TPRESET.find(TPRESET.active or "")
+    if not p then return "" end
+    local set = {}
+    for _, k in ipairs(TITAN_FLAGS) do
+        if p.flags[k] then set[#set + 1] = k:gsub("^No", "") end
+    end
+    return (#set > 0) and table.concat(set, ", ") or "(empty - clears everything)"
+end)
 
 end  -- /Character tab
 -- ===== Tab: Tools (wrench) — opens the smooth Requiem-UI RS Diff panel =====
@@ -3492,6 +3733,10 @@ if Features.NoAttack then pcall(applyNoAttack) end
 if Features.CanRollUnlock then pcall(applyCanRollUnlock) end
 if Features.AutoPin then pcall(applyAutoPin) end
 if Features.VeloHUD then pcall(applyVeloHUD) end
+-- A persisted "Preset Active" re-applies here, AFTER the tabs are built — TPRESET.ctl is only
+-- populated as the Titans section constructs its toggles, and applying earlier would set Features
+-- without the menu ever reflecting it.
+if TPRESET.on and TPRESET.active then pcall(function() TPRESET.apply(TPRESET.active) end) end
 
 -- End key = full unload (the library owns the F3 menu toggle).
 -- RELEASE-ARM GUARD (mirrors Menu.lua's CloseKeyReady): only unload AFTER the close key has
