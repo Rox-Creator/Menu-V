@@ -1894,6 +1894,7 @@ local TPRESET = {
     list     = {},        -- ordered: { { name = "boss", flags = { NoGrab = true, ... } }, ... }
     active   = nil,       -- name of the selected preset
     on       = false,     -- master switch
+    lastOn   = nil,       -- flags captured the last time the switch was turned OFF, so ON restores
     applying = false,     -- see setFlags(): suppresses the per-toggle titan sync
     ctl      = {},        -- [flagName] = the toggle's control handle, so the menu can be resynced
     pending  = "",        -- contents of the Name textbox
@@ -2001,6 +2002,10 @@ function TPRESET.load()
             TPRESET.active = (v ~= "" and v) or nil
         elseif k == "on" then
             TPRESET.on = (v == "1")
+        elseif k == "last" then
+            local flags, any = {}, false
+            for fl in v:gmatch("[^,]+") do flags[fl] = true; any = true end
+            if any then TPRESET.lastOn = flags end
         end
     end
     if TPRESET.active and not TPRESET.find(TPRESET.active) then TPRESET.active = nil end
@@ -2014,6 +2019,11 @@ function TPRESET.save()
         end
     end)
     local out = { "on=" .. (TPRESET.on and "1" or "0"), "active=" .. tostring(TPRESET.active or "") }
+    if TPRESET.lastOn then
+        local set = {}
+        for _, k in ipairs(TITAN_FLAGS) do if TPRESET.lastOn[k] then set[#set + 1] = k end end
+        out[#out + 1] = "last=" .. table.concat(set, ",")
+    end
     for _, p in ipairs(TPRESET.list) do
         local set = {}
         for _, k in ipairs(TITAN_FLAGS) do if p.flags[k] then set[#set + 1] = k end end
@@ -3396,6 +3406,91 @@ secAck:Button("Reset Defaults", function()
     Lib:Notify("Ackerman", "Reset to defaults - press each Pin to apply", 3, "success")
 end):Tooltip("restore the default numbers (shown on each box)")
 
+-- ===== Titan presets =====
+-- Built BEFORE the Titans section and in the RIGHT column on purpose: the left column already
+-- carries the tall Ackerman panel, so a section added there lands below the fold and looks like it
+-- never rendered at all. Sitting directly above the toggles it controls also makes it obvious.
+local secTP = tabChar:Section("Titan Presets", "Right", "Saved Anti-Hitbox Sets")
+
+local function tpRefreshDropdown()
+    if not TPRESET.dd then return end
+    pcall(function() TPRESET.dd:UpdateChoices(TPRESET.names()) end)
+    pcall(function() TPRESET.dd:Set(TPRESET.active or "") end)
+end
+
+TPRESET.dd = secTP:Dropdown("Active Preset", TPRESET.active or "", TPRESET.names(), false, function(v)
+    -- Single-select dropdowns still hand back a TABLE (the library wraps every value via a2()).
+    local pick = v
+    if type(pick) == "table" then pick = pick[1] end
+    pick = tostring(pick or "")
+    TPRESET.active = (pick ~= "" and pick) or nil
+    TPRESET.saveAt = os.clock() + 0.5
+    -- Switching preset while the master switch is ON swaps the live set immediately.
+    if TPRESET.on and TPRESET.active then TPRESET.apply(TPRESET.active) end
+end):Tooltip("optional - leave empty and the switch just remembers whatever you had on")
+
+secTP:Toggle("Preset Active", TPRESET.on, function(v)
+    TPRESET.on = v
+    TPRESET.saveAt = os.clock() + 0.5
+    if v then
+        -- ON: a named preset wins if one is selected; otherwise put back whatever was on the last
+        -- time you switched off.
+        local _, p = TPRESET.find(TPRESET.active or "")
+        if p then
+            TPRESET.setFlags(p.flags)
+        elseif TPRESET.lastOn and TPRESET.count(TPRESET.lastOn) > 0 then
+            TPRESET.setFlags(TPRESET.lastOn)
+        else
+            Lib:Notify("Titan Presets",
+                "nothing remembered yet - switch some toggles on, then flip this off and back on", 6, "warning")
+        end
+    else
+        -- ⚠ OFF REMEMBERS FIRST. This is what makes the switch useful with zero setup: it reads
+        -- whatever you currently have on, stores it, and only then clears. Flipping back on restores
+        -- exactly that set. Without this step the switch could only ever turn things off.
+        local cur = TPRESET.capture()
+        if TPRESET.count(cur) > 0 then TPRESET.lastOn = cur end
+        TPRESET.clearAll()
+    end
+end):AddKeybind("v", "Toggle")
+   :Tooltip("OFF remembers what you had on and clears it, ON puts it back - bound to V")
+
+secTP:Label(function()
+    local _, p = TPRESET.find(TPRESET.active or "")
+    local src = p and p.flags or TPRESET.lastOn
+    if not src or TPRESET.count(src) == 0 then return "remembers nothing yet" end
+    local set = {}
+    for _, k in ipairs(TITAN_FLAGS) do
+        if src[k] then set[#set + 1] = k:gsub("^No", "") end
+    end
+    return (TPRESET.on and "ON  " or "off ") .. (p and ("'" .. p.name .. "'  ") or "remembered  ")
+        .. table.concat(set, ", ")
+end)
+
+secTP:Textbox("Name", "", function(s) TPRESET.pending = tostring(s or "") end)
+    :Tooltip("only needed if you want more than one saved set")
+
+secTP:Button("Save Current", function()
+    -- Name box wins, then the selected preset (in-place overwrite), then an auto-name so this
+    -- button never just refuses to do anything.
+    local name = TPRESET.pending
+    if name == nil or name:gsub("%s", "") == "" then name = TPRESET.active end
+    if name == nil or name == "" then name = "preset " .. (#TPRESET.list + 1) end
+    local saved = TPRESET.saveTo(name)
+    if not saved then Lib:Notify("Titan Presets", "could not save", 4, "warning"); return end
+    tpRefreshDropdown()
+    Lib:Notify("Titan Presets", "saved '" .. saved .. "' (" .. TPRESET.count(TPRESET.capture()) .. " toggles)", 3, "success")
+end):Tooltip("store the No-* toggles exactly as they are right now")
+
+secTP:Button("Delete", function()
+    if not TPRESET.active then Lib:Notify("Titan Presets", "nothing selected", 3, "warning"); return end
+    local gone = TPRESET.active
+    if TPRESET.delete(gone) then
+        tpRefreshDropdown()
+        Lib:Notify("Titan Presets", "deleted '" .. gone .. "'", 3, "success")
+    end
+end):SetRisk()
+
 local secTitan = tabChar:Section("Titans", "Right", "Anti-Hitbox + Weakpoints")
 -- Every one of these stores its handle in TPRESET.ctl so a preset can resync the menu, and every
 -- one skips its own titan sync while a preset is being applied (TPRESET.setFlags does a single
@@ -3440,84 +3535,6 @@ end):AddKeybind("g", "Toggle"):Tooltip("extend the nape/eye weakpoints toward yo
 secTitan:Toggle("Extend Nape", Features.ExtendNape, function(v) Features.ExtendNape = v end)
 secTitan:Toggle("Extend Eyes", Features.ExtendEye, function(v) Features.ExtendEye = v end)
 secTitan:Slider("Range", NapeFollowRange, 1, 30, 900, "", function(v) NapeFollowRange = v end)
-
--- ===== Titan presets =====
--- Name a set of the No-* toggles, save it, and flip the whole set with one switch (or its bind).
-local secTP = tabChar:Section("Titan Presets", "Left", "Saved Anti-Hitbox Sets")
-
-local function tpRefreshDropdown()
-    if not TPRESET.dd then return end
-    pcall(function() TPRESET.dd:UpdateChoices(TPRESET.names()) end)
-    pcall(function() TPRESET.dd:Set(TPRESET.active or "") end)
-end
-
-TPRESET.dd = secTP:Dropdown("Active Preset", TPRESET.active or "", TPRESET.names(), false, function(v)
-    -- Single-select dropdowns still hand back a TABLE (the library wraps every value via a2()).
-    local pick = v
-    if type(pick) == "table" then pick = pick[1] end
-    pick = tostring(pick or "")
-    TPRESET.active = (pick ~= "" and pick) or nil
-    TPRESET.saveAt = os.clock() + 0.5
-    -- Switching preset while the master switch is ON swaps the live set immediately.
-    if TPRESET.on and TPRESET.active then TPRESET.apply(TPRESET.active) end
-end):Tooltip("which saved set the switch below applies")
-
-secTP:Textbox("Name", "", function(s) TPRESET.pending = tostring(s or "") end)
-    :Tooltip("type a name here, then press Save Current")
-
-secTP:Button("Save Current", function()
-    -- Name box wins; falling back to the selected preset makes this an in-place overwrite.
-    local name = TPRESET.pending
-    if name == nil or name:gsub("%s", "") == "" then name = TPRESET.active end
-    local saved = TPRESET.saveTo(name)
-    if not saved then
-        Lib:Notify("Titan Presets", "type a name first", 4, "warning")
-        return
-    end
-    tpRefreshDropdown()
-    Lib:Notify("Titan Presets", "saved '" .. saved .. "' (" .. TPRESET.count(TPRESET.capture()) .. " toggles)", 3, "success")
-end):Tooltip("store the No-* toggles exactly as they are right now, under the typed name")
-
-secTP:Button("Delete", function()
-    if not TPRESET.active then Lib:Notify("Titan Presets", "nothing selected", 3, "warning"); return end
-    local gone = TPRESET.active
-    if TPRESET.delete(gone) then
-        tpRefreshDropdown()
-        Lib:Notify("Titan Presets", "deleted '" .. gone .. "'", 3, "success")
-    end
-end):SetRisk()
-
-secTP:Toggle("Preset Active", TPRESET.on, function(v)
-    TPRESET.on = v
-    TPRESET.saveAt = os.clock() + 0.5
-    if v then
-        if TPRESET.active and TPRESET.apply(TPRESET.active) then
-            Lib:Notify("Titan Presets", "applied '" .. TPRESET.active .. "'", 2, "success")
-        else
-            Lib:Notify("Titan Presets", "no preset selected - save one first", 4, "warning")
-        end
-    else
-        -- OFF is a deliberate panic-off: every No-* toggle clears, whatever was on before.
-        TPRESET.clearAll()
-    end
-end):AddKeybind("v", "Toggle")
-   :Tooltip("ON applies the selected preset, OFF clears EVERY No-* toggle - bound to V")
-
-secTP:Label(function()
-    if #TPRESET.list == 0 then return "no presets saved yet" end
-    local _, p = TPRESET.find(TPRESET.active or "")
-    if not p then return #TPRESET.list .. " saved   (none selected)" end
-    return (TPRESET.on and "ON  " or "off ") .. p.name .. "  -  " .. TPRESET.count(p.flags) .. " toggles"
-end)
-secTP:Label(function()
-    local _, p = TPRESET.find(TPRESET.active or "")
-    if not p then return "" end
-    local set = {}
-    for _, k in ipairs(TITAN_FLAGS) do
-        if p.flags[k] then set[#set + 1] = k:gsub("^No", "") end
-    end
-    return (#set > 0) and table.concat(set, ", ") or "(empty - clears everything)"
-end)
 
 end  -- /Character tab
 -- ===== Tab: Tools (wrench) — opens the smooth Requiem-UI RS Diff panel =====
@@ -3736,7 +3753,11 @@ if Features.VeloHUD then pcall(applyVeloHUD) end
 -- A persisted "Preset Active" re-applies here, AFTER the tabs are built — TPRESET.ctl is only
 -- populated as the Titans section constructs its toggles, and applying earlier would set Features
 -- without the menu ever reflecting it.
-if TPRESET.on and TPRESET.active then pcall(function() TPRESET.apply(TPRESET.active) end) end
+if TPRESET.on then pcall(function()
+    local _, p = TPRESET.find(TPRESET.active or "")
+    if p then TPRESET.setFlags(p.flags)
+    elseif TPRESET.lastOn then TPRESET.setFlags(TPRESET.lastOn) end
+end) end
 
 -- End key = full unload (the library owns the F3 menu toggle).
 -- RELEASE-ARM GUARD (mirrors Menu.lua's CloseKeyReady): only unload AFTER the close key has
