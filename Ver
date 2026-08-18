@@ -1055,6 +1055,8 @@ local SKULL = {
     saveAt = nil,
     drag = false, resize = false, dx = 0, dy = 0,
     inCombat = false,
+    preview  = false,        -- placement mode: draw and allow dragging even when out of combat
+    raw      = nil,          -- last raw attribute value, surfaced in the panel for diagnosis
     attrKey = "InCombat",    -- replaced if the real attribute turns out to be spelled differently
     model = nil, nextModel = 0, nextSweep = 0,
 }
@@ -1151,30 +1153,46 @@ function SKULL.myModel(nowc)
     return SKULL.model
 end
 
+-- Absent and false mean the same thing. Anything else genuinely truthy counts as in combat, so a
+-- build that stores 1 instead of true still works — but the falsey-looking STRINGS are excluded
+-- explicitly, because a bridge that hands back "false" or "" or "nil" as text would otherwise read
+-- as in-combat forever, which is exactly the "it never turns off" failure.
+local function combatTruthy(v)
+    if v == nil or v == false or v == 0 then return false end
+    if type(v) == "string" then
+        local s = string.lower(v)
+        if s == "" or s == "false" or s == "nil" or s == "0" then return false end
+    end
+    return true
+end
+
 function SKULL.poll(nowc)
     local m = SKULL.myModel(nowc)
-    if not m then SKULL.inCombat = false; return end
+    if not m then SKULL.inCombat = false; SKULL.raw = nil; return end
     local v
     pcall(function() v = m:GetAttribute(SKULL.attrKey) end)
     if v == nil and nowc >= SKULL.nextSweep then
-        -- The cheap read found nothing. Twice a second at most, sweep every attribute for a key that
-        -- lowercases to "incombat" and adopt whatever spelling the game actually uses.
+        -- The cheap read found nothing. Twice a second at most, look for a differently-spelled key.
         SKULL.nextSweep = nowc + 2
         local all
         pcall(function() all = m:GetAttributes() end)
         if type(all) == "table" then
+            -- ⚠ Matcha's GetAttributes() returns an ARRAY OF NAMES, not a name->value map: it comes
+            -- back as {"Age","BandageCount",...}. The previous loop compared the numeric INDEX
+            -- against "incombat", so it could never match and this whole fallback was dead code.
+            -- Handle both shapes, then read the value with a normal GetAttribute.
             for k, val in pairs(all) do
-                if string.lower(tostring(k)) == "incombat" then
-                    SKULL.attrKey = k
-                    v = val
+                local nm = (type(k) == "number" and type(val) == "string") and val or k
+                if type(nm) == "string" and string.lower(nm) == "incombat" then
+                    SKULL.attrKey = nm
+                    pcall(function() v = m:GetAttribute(nm) end)
                     break
                 end
             end
         end
     end
-    -- Absent and false mean the same thing. Anything else truthy counts as in combat, so a build
-    -- that stores 1 instead of true still works.
-    SKULL.inCombat = (v ~= nil and v ~= false and v ~= 0)
+    SKULL.raw = v                      -- surfaced in the Misc panel so this is never a guess again
+    SKULL.inCombat = combatTruthy(v)
 end
 
 restoreCombatSkull = function()
@@ -1210,11 +1228,13 @@ applyCombatSkull = function()
             local nowc = os.clock()
             pcall(SKULL.poll, nowc)
 
-            -- While the menu is open the skull is always shown, so it can be positioned and sized
-            -- without having to be punched first.
-            local menuOpen = false
-            pcall(function() menuOpen = (LibWindow and LibWindow:IsOpen()) and true or false end)
-            local show = SKULL.inCombat or menuOpen
+            -- ⚠ SHOWN ONLY WHEN ACTUALLY IN COMBAT, or when Preview is deliberately switched on.
+            -- This used to draw whenever the MENU was open, which was meant as a placement aid but
+            -- reads exactly like a stuck detection: open the menu and the skull is there whether or
+            -- not InCombat is set. (LibWindow:IsOpen() does work — CreateWindow returns the library
+            -- table itself and IsOpen reads its `open` flag — so it was showing, not malfunctioning.)
+            -- Placement is now an explicit toggle instead of a side effect of opening the menu.
+            local show = SKULL.inCombat or SKULL.preview
 
             if show and not SKULL.data then SKULL.loadImage() end
 
@@ -1253,7 +1273,7 @@ applyCombatSkull = function()
                 end
                 if SKULL.txt then
                     pcall(function()
-                        SKULL.txt.Text = SKULL.inCombat and "IN COMBAT" or "IN COMBAT (no skull.png)"
+                        SKULL.txt.Text = SKULL.inCombat and "IN COMBAT" or "[preview] no skull.png"
                         SKULL.txt.Position = Vector2.new(math.floor(SKULL.x), math.floor(SKULL.y))
                         SKULL.txt.Visible = true
                     end)
@@ -1264,11 +1284,12 @@ applyCombatSkull = function()
                 if SKULL.txt then pcall(function() SKULL.txt.Visible = false end) end
             end
 
-            -- Drag / resize, only while the menu is open: M1 is the attack button, so a HUD that
-            -- could be grabbed mid-fight would swallow swings.
+            -- Drag / resize ONLY in Preview mode. M1 is the attack button, so the HUD must never be
+            -- grabbable during normal play; gating on Preview rather than on the menu being open
+            -- also means it cannot eat a swing just because the menu happens to be up.
             local down = false
-            if menuOpen then pcall(function() down = ismouse1pressed() end) end
-            if menuOpen and down then
+            if SKULL.preview then pcall(function() down = ismouse1pressed() end) end
+            if SKULL.preview and down then
                 local mx, my = Mouse.X, Mouse.Y
                 if not wasDown then
                     local gx, gy = SKULL.x + SKULL.size - 14, SKULL.y + SKULL.size - 14
@@ -3888,6 +3909,11 @@ secSkull:Toggle("Combat Skull", Features.CombatSkull, function(v)
     Features.CombatSkull = v
     if v then applyCombatSkull() else restoreCombatSkull() end
 end):Tooltip("show a skull while your own InCombat attribute is set - bottom-left by default")
+-- Placement is deliberate now. The skull used to draw whenever the MENU was open, which was meant
+-- as a placement aid but was indistinguishable from the detection being stuck on.
+secSkull:Toggle("Preview / Position", SKULL.preview, function(v)
+    SKULL.preview = v
+end):Tooltip("show the skull and allow dragging/resizing while OUT of combat - turn this off when you are done placing it")
 secSkull:Slider("Size", SKULL.size, 1, 24, 400, "px", function(v)
     SKULL.size = math.max(24, math.min(tonumber(v) or SKULL.size, 400))
     SKULL.saveAt = os.clock() + 0.6
@@ -3908,8 +3934,16 @@ end):Tooltip("re-read skull.png from disk, or download it again if it is missing
 -- The whole point of these two lines: an image that fails to load, or an attribute whose real
 -- spelling differs from the guess, both used to be completely invisible failures.
 secSkull:Label(function() return "image: " .. tostring(SKULL.status) end)
+-- Shows the RAW attribute value and its type, not just the verdict. If the skull ever sticks on
+-- again, this line says immediately whether the attribute is genuinely set, or is coming back as
+-- something falsey-looking that only reads as truthy (an empty string, the text "false", ...).
 secSkull:Label(function()
-    return (SKULL.inCombat and "IN COMBAT" or "not in combat") .. "   attr: " .. tostring(SKULL.attrKey)
+    return (SKULL.inCombat and "IN COMBAT" or "not in combat")
+        .. (SKULL.preview and "  [preview]" or "")
+end)
+secSkull:Label(function()
+    return "attr " .. tostring(SKULL.attrKey) .. " = " .. tostring(SKULL.raw)
+        .. " (" .. type(SKULL.raw) .. ")"
 end)
 
 end  -- /Misc tab
