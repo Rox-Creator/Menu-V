@@ -2764,7 +2764,6 @@ local function UnloadScript()
     -- Tear down the INS-ui window (cleanup closure is installed at startup)
     pcall(function() if _G.MatchaCleanup then _G.MatchaCleanup() end end)
     _G.MatchaCleanup = nil
-    _G.RQTypingGuard = nil     -- drop the hook so it cannot outlive this run and block a later one
     pcall(restoreHorseWatch)
     if Horse.SnapTaken then pcall(restoreHorse) end
     -- Tear down buff Heartbeat pins
@@ -2825,12 +2824,7 @@ do
     -- Forked UI lib (bigger panel text + click-logo-to-minimize) is tried FIRST; if it ever
     -- fails to fetch/parse, we fall straight through to upstream INS-ui so the menu still loads.
     local UI_URLS = {
-        -- Canonical fork path. `aaa-v` was renamed to `Menu-V` and still redirects, but pointing at
-        -- the real name removes a redirect hop and any doubt about which copy is served.
-        "https://raw.githubusercontent.com/Rox-Creator/Menu-V/main/uilib.lua",         -- forked
-        -- ⚠ UPSTREAM IS NOT PATCHED. If this fallback is what loads, the typing guard cannot work
-        -- (nor can the version badge or the inline Pin buttons) — the Settings panel's
-        -- "uilib hook: NEVER CALLED" line is what surfaces that.
+        "https://raw.githubusercontent.com/Rox-Creator/aaa-v/main/uilib.lua",          -- forked
         "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua",  -- upstream fallback
     }
     local lastBody
@@ -2898,74 +2892,6 @@ _G.MatchaCleanup = function() pcall(function() Lib:Destroy() end) end
 -- by _didAutoload), so once we win the race after it fires, autosave stays off for good.
 -- Verfall persists via the named config save in Settings instead. (We deliberately DON'T
 -- enable lite/perf mode — it strips the menu animations that make it feel smooth.)
-
--- ============================================================
--- TYPING GUARD — binds must not fire while you type in Roblox chat
--- ============================================================
--- The UI library already gates EVERY input read on isrbxactive(): when Roblox is not the foreground
--- window, that flag is false and all keys read as unpressed. Typing in chat is the same situation
--- from the menu's point of view, so the fork now consults _G.RQTypingGuard at that exact spot —
--- KEYBOARD ONLY, so mouse clicks still land and the menu stays usable with the chat bar open.
--- Returning true here makes every bind inert: F3, the Hitbox Expander on G, the preset switch on V,
--- and the End unload watcher further down.
---
--- FAILURE POSTURE: if neither the focus events nor the poll work on a given build, `on` stays false
--- and behaviour is exactly what it is today. A bind that occasionally fires while typing is a much
--- smaller problem than one that is permanently dead, so every fallback leans that way.
-local TYPING = { on = false, enabled = true, ev = false, seen = 0, src = "none", hookAge = nil }
-do
-    local UIS = game:GetService("UserInputService")
-    local TCS; pcall(function() TCS = game:GetService("TextChatService") end)
-
-    -- Event path. Fires for ordinary in-game TextBoxes.
-    pcall(function()
-        UIS.TextBoxFocused:Connect(function() TYPING.ev = true end)
-        UIS.TextBoxFocusReleased:Connect(function() TYPING.ev = false end)
-    end)
-
-    -- The hook the patched library calls. Recording WHEN it was last called is the whole diagnosis
-    -- for "the guard does nothing": if this timestamp never advances, the running uilib is not the
-    -- patched one (a stale GitHub raw cache, or the upstream fallback got loaded instead), and no
-    -- amount of focus detection on this side can matter.
-    _G.RQTypingGuard = function()
-        TYPING.seen = os.clock()
-        return TYPING.enabled and TYPING.on
-    end
-
-    task.spawn(function()
-        local quiet = 0
-        while GUI.Running do
-            local pollOn, src = false, "none"
-
-            -- 1) Classic TextBoxes belonging to the game's own UI.
-            local ok, box = pcall(function() return UIS:GetFocusedTextBox() end)
-            if ok and box ~= nil then pollOn, src = true, "textbox" end
-
-            -- 2) ⚠ THE ONE THAT ACTUALLY MATTERS FOR CHAT. Roblox's modern chat input lives in
-            --    CoreGui, which GetFocusedTextBox generally cannot see from a game script — which
-            --    is why watching only TextBoxes looked like it did nothing. TextChatService
-            --    publishes the input bar's focus state directly.
-            if not pollOn and TCS then
-                local ok2, f = pcall(function() return TCS.ChatInputBarConfiguration.IsFocused end)
-                if ok2 and f == true then pollOn, src = true, "chatbar" end
-            end
-
-            -- Either source is enough. The event flag is ORed in so a build where polling fails
-            -- still works...
-            TYPING.on = pollOn or TYPING.ev
-            TYPING.src = pollOn and src or (TYPING.ev and "event" or "none")
-
-            -- ...but a TextBoxFocused with no matching release would otherwise wedge the binds off
-            -- permanently, so two consecutive quiet polls clear the latch.
-            if pollOn then quiet = 0 else quiet = quiet + 1; if quiet >= 2 then TYPING.ev = false end end
-
-            TYPING.hookAge = os.clock() - (TYPING.seen or 0)
-            task.wait(0.15)
-        end
-        _G.RQTypingGuard = nil                -- never leave a stale hook blocking a later run
-    end)
-end
-
 pcall(function() Lib:SetAutoSave(false) end)
 task.spawn(function()
     -- SetAutoSave is pure-Lua (just sets az.autoSave, no bridge), so re-asserting it is free.
@@ -4220,23 +4146,6 @@ secTheme:Slider("Menu Opacity", 100, 5, 40, 100, "%", function(v) pcall(function
 -- custom pair only rewrote internal state, which is why its own button text had to say "reload
 -- script to refresh toggles". Reset Defaults stays (it resets in-script values the lib can't reach).
 local secScript = setTab:Section("Script", "Right", "Config & Exit")
-secScript:Toggle("Ignore Binds While Typing", TYPING.enabled, function(v)
-    TYPING.enabled = v
-end):Tooltip("suppress every keybind while a Roblox text box has focus, so typing in chat cannot fire F3 / G / V / End")
--- These two lines split the failure in half, so "it still doesn't work" stops being guesswork:
---   line 1 = did WE detect focus,  line 2 = is the PATCHED library actually running.
--- Open chat and watch. Detecting but still firing => old uilib. Not detecting => focus source.
-secScript:Label(function()
-    if not TYPING.enabled then return "guard off - binds always live" end
-    return (TYPING.on and "TYPING - binds suppressed" or "binds live") .. "   via: " .. tostring(TYPING.src)
-end)
-secScript:Label(function()
-    local age = TYPING.hookAge
-    if age == nil or (TYPING.seen or 0) == 0 then
-        return "uilib hook: NEVER CALLED - old uilib is loaded"
-    end
-    return age < 1 and "uilib hook: active" or ("uilib hook: stale " .. string.format("%.0fs", age))
-end)
 secScript:Button("Reset Defaults", function() pcall(resetConfig); Lib:Notify("Verfall", "reset — reload script to refresh the menu", 4) end)
 secScript:Button("Unload", function() pcall(UnloadScript) end):SetRisk()
 
@@ -4273,10 +4182,6 @@ task.spawn(function()
     while GUI.Running do
         local ok, down = pcall(iskeypressed, GUI.CloseKey or 0x23)
         down = ok and down or false
-        -- This watcher polls iskeypressed DIRECTLY, so the library's typing guard cannot cover it.
-        -- Without this, pressing End to jump to the end of a line you are typing would unload the
-        -- whole script — End is a text-navigation key as well as the unload bind.
-        if TYPING.enabled and TYPING.on then down = false end
         if ready then
             if down and not wasDown then pcall(UnloadScript); return end
         elseif not down then
