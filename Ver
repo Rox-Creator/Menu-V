@@ -1336,6 +1336,227 @@ end
 SKULL.load()
 
 -- ============================================================
+-- CRATE ESP — what is in each item crate, and where
+-- ============================================================
+-- Live-verified structure (2026-08-20). The crates live at
+--     Workspace.World.ItemBags.<ToolGiver>.Crate      -- a PART, not the model
+-- and THE ATTRIBUTES ARE ON THAT PART, not on the ToolGiver above it. That distinction is the whole
+-- reason a first sweep found nothing: every ToolGiver model reports zero attributes of its own.
+--     Item   [string]  display name, e.g. "Wood", "Cannonball", "Standard Issue Long Cloak"
+--     Amount [number]  how many
+--     DropId [string]  same as Item on every sample seen
+--     Health [number]  100 (crates are breakable)
+-- Measured live: 34 ToolGivers, all 34 carrying a Crate part.
+--
+-- The map also contains ~432 crate-SHAPED props (Crates / BladeCrate / Crate Cart 2 / Storages).
+-- Not one of them has a single attribute, so scanning ItemBags rather than matching on names keeps
+-- all of that scenery out for free.
+local CRATE = {
+    ESP = false,
+    MaxDist = 2000, MaxDraw = 40,
+    size = 14, fontName = "System",
+    r = 255, g = 210, b = 80,          -- per channel so a colourpicker can drive it
+    Path = CONFIG_DIR .. "/crateesp.txt",
+    saveAt = nil,
+    entries = {}, order = nil, oi = 1,
+    me = nil, tracked = 0,
+    col = nil, colDirty = true,
+}
+
+function CRATE.load()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then return end
+    local exists = false
+    pcall(function() exists = isfile(CRATE.Path) end)
+    if not exists then return end
+    local ok, raw = pcall(readfile, CRATE.Path)
+    if not (ok and type(raw) == "string") then return end
+    for k, v in raw:gmatch("(%w+)%s*=%s*([^\r\n]*)") do
+        v = (v:gsub("%s+$", ""))
+        if     k == "size" then CRATE.size    = math.max(8, math.min(tonumber(v) or CRATE.size, 40))
+        elseif k == "dist" then CRATE.MaxDist = math.max(50, math.min(tonumber(v) or CRATE.MaxDist, 100000))
+        elseif k == "font" and v ~= "" then CRATE.fontName = v
+        elseif k == "r" then CRATE.r = tonumber(v) or CRATE.r
+        elseif k == "g" then CRATE.g = tonumber(v) or CRATE.g
+        elseif k == "b" then CRATE.b = tonumber(v) or CRATE.b end
+    end
+    CRATE.colDirty = true
+end
+
+function CRATE.save()
+    if type(writefile) ~= "function" then return end
+    pcall(function()
+        if type(makefolder) == "function" and type(isfolder) == "function" and not isfolder(CONFIG_DIR) then
+            makefolder(CONFIG_DIR)
+        end
+    end)
+    pcall(writefile, CRATE.Path, table.concat({
+        "size=" .. math.floor(CRATE.size),
+        "dist=" .. math.floor(CRATE.MaxDist),
+        "font=" .. tostring(CRATE.fontName),
+        "r=" .. math.floor(CRATE.r), "g=" .. math.floor(CRATE.g), "b=" .. math.floor(CRATE.b),
+    }, "\n"))
+end
+
+-- Read one crate's contents. Cheap: two GetAttribute calls on a part already resolved.
+function CRATE.readOne(e)
+    local c = e.part
+    if not c then return end
+    local item, amt
+    pcall(function() item = c:GetAttribute("Item") end)
+    pcall(function() amt  = c:GetAttribute("Amount") end)
+    item = (type(item) == "string" and item ~= "") and item or nil
+    amt  = tonumber(amt)
+    e.item, e.amount = item, amt
+    -- Cache the rendered string. Amount changes when somebody loots, so it is rebuilt only when the
+    -- pair actually differs, never per frame.
+    local s = (item or "?") .. " : " .. (amt and math.floor(amt) or "?")
+    if e.label ~= s then e.label = s; e.dirty = true end
+end
+
+-- DISCOVERY. Lists ItemBags and resolves each crate's PART once; attributes ride the slow
+-- round-robin below, since realistically only Amount changes.
+function CRATE.scan()
+    local w = Workspace:FindFirstChild("World")
+    local bags = w and w:FindFirstChild("ItemBags")
+    if not bags then CRATE.tracked = 0; return end
+    local kids
+    if not pcall(function() kids = bags:GetChildren() end) then return end
+    if not kids then return end
+    local present = {}
+    for _, m in ipairs(kids) do
+        local ad
+        pcall(function() ad = tonumber(m.Address) end)
+        local key = ad and string.format("%.0f", ad) or nil   -- %.0f, never tostring (sci notation)
+        if key then
+            present[key] = true
+            local e = CRATE.entries[key]
+            if not e then
+                local part
+                pcall(function() part = m:FindFirstChild("Crate") end)
+                if part then
+                    e = { key = key, model = m, part = part }
+                    CRATE.entries[key] = e
+                    CRATE.order = nil
+                    CRATE.readOne(e)
+                    pcall(function() e.pos = part.Position end)   -- crates do not walk; sample once
+                end
+            else
+                e.model = m
+            end
+        end
+    end
+    for key, e in pairs(CRATE.entries) do
+        if not present[key] then
+            if e.bundle then pcall(function() e.bundle:Remove() end) end
+            CRATE.entries[key] = nil
+            CRATE.order = nil
+        end
+    end
+    local n = 0
+    for _ in pairs(CRATE.entries) do n = n + 1 end
+    CRATE.tracked = n
+end
+
+-- Refresh Amount for a few crates per tick, re-sampling position for the same few in case one was
+-- knocked over. Round-robin, so the cost is flat however many crates exist.
+function CRATE.refresh()
+    local list = CRATE.order
+    if not list or CRATE.oi > #list then
+        list = {}
+        for _, e in pairs(CRATE.entries) do list[#list + 1] = e end
+        CRATE.order, CRATE.oi = list, 1
+    end
+    pcall(function()
+        local ch = LocalPlayer.Character
+        local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+        CRATE.me = hrp and hrp.Position or nil
+    end)
+    local done = 0
+    while CRATE.oi <= #list and done < 5 do
+        local e = list[CRATE.oi]
+        CRATE.oi = CRATE.oi + 1
+        done = done + 1
+        if e and CRATE.entries[e.key] then
+            local live = false
+            if e.part then
+                local ok, p = pcall(function() return e.part.Parent end)
+                live = (ok and p ~= nil)
+            end
+            if not live then pcall(function() e.part = e.model and e.model:FindFirstChild("Crate") end) end
+            if e.part then
+                CRATE.readOne(e)
+                pcall(function() e.pos = e.part.Position end)
+            end
+        end
+    end
+end
+
+-- RENDERER. Pure: cached positions only, one WorldToScreen per drawn crate, nearest-N capped.
+function CRATE.draw()
+    if CRATE.colDirty then
+        CRATE.colDirty = false
+        CRATE.col = Color3.fromRGB(math.floor(CRATE.r), math.floor(CRATE.g), math.floor(CRATE.b))
+        for _, e in pairs(CRATE.entries) do e.dirty = true end
+    end
+    local me = CRATE.me
+    local drawn = 0
+    for _, e in pairs(CRATE.entries) do
+        local shown = false
+        if CRATE.ESP and me and e.pos and e.label and drawn < CRATE.MaxDraw then
+            local d = (e.pos - me).Magnitude
+            if d <= CRATE.MaxDist then
+                local ok, screen, on = pcall(WorldToScreen, e.pos + Vector3.new(0, 2.5, 0))
+                if ok and screen and on then
+                    if not e.bundle then
+                        local okB, t = pcall(function()
+                            local o = Drawing.new("Text")
+                            o.Center = true; o.Outline = true; o.Visible = false; o.ZIndex = 4
+                            return o
+                        end)
+                        e.bundle = okB and t or nil
+                        e.dirty = true
+                    end
+                    local t = e.bundle
+                    if t then
+                        -- Text/size/font/colour are written only when something actually changed.
+                        if e.dirty or e._size ~= CRATE.size or e._font ~= CRATE.fontName then
+                            e.dirty = false
+                            e._size, e._font = CRATE.size, CRATE.fontName
+                            pcall(function()
+                                t.Text  = e.label
+                                t.Size  = CRATE.size
+                                t.Font  = veloFont(CRATE.fontName)   -- the discovered-font helper
+                                t.Color = CRATE.col
+                            end)
+                        end
+                        t.Position = Vector2.new(math.floor(screen.X + 0.5), math.floor(screen.Y + 0.5))
+                        if not e._vis then t.Visible = true; e._vis = true end
+                        shown, drawn = true, drawn + 1
+                    end
+                end
+            end
+        end
+        if not shown and e.bundle and e._vis then e.bundle.Visible = false; e._vis = false end
+    end
+end
+
+function CRATE.hideAll()
+    for _, e in pairs(CRATE.entries) do
+        if e.bundle and e._vis then pcall(function() e.bundle.Visible = false end); e._vis = false end
+    end
+end
+
+function GUI.CrateCleanup()
+    for key, e in pairs(CRATE.entries) do
+        if e.bundle then pcall(function() e.bundle:Remove() end) end
+        CRATE.entries[key] = nil
+    end
+    CRATE.order = nil
+end
+
+CRATE.load()
+
+-- ============================================================
 -- BUFFS — ClientInformation attribute pins
 -- HookRange = 1000 : extended grapple distance (confirmed working)
 -- GasConservation = 1000 (server clamps to ~2) : slower gas drain (confirmed working)
@@ -2761,6 +2982,7 @@ local function UnloadScript()
     -- loop that would otherwise write it).
     pcall(function() if TPRESET.saveAt then TPRESET.saveAt = nil; TPRESET.save() end end)
     pcall(function() if GUI.CorpseCleanup then GUI.CorpseCleanup() end end)
+    pcall(function() if GUI.CrateCleanup then GUI.CrateCleanup() end end)
     -- Tear down the INS-ui window (cleanup closure is installed at startup)
     pcall(function() if _G.MatchaCleanup then _G.MatchaCleanup() end end)
     _G.MatchaCleanup = nil
@@ -2870,6 +3092,33 @@ if GUI.StartEspLoops then GUI.StartEspLoops() end
 local YELLOW_A = Color3.fromRGB(252, 211, 49)
 local YELLOW_B = Color3.fromRGB(240, 165, 25)
 Lib:SetTheme({ accentA = YELLOW_A, accentB = YELLOW_B, bg = Color3.fromRGB(18, 17, 13), sidebar = Color3.fromRGB(18, 17, 13) })
+
+-- ============================================================
+-- KEYBIND PANEL POSITION — remember where it was dragged to
+-- ============================================================
+-- The library's "keybinds" card is ALREADY draggable by its header; it just defaults to {18,90}
+-- every launch, which is top-left, over the Roblox chat. The fork now consults _G.RQHkLoad ONCE
+-- when that panel first initialises, and publishes the live position table as _G.RQHkPos.
+-- ⚠ RQHkLoad MUST be set before CreateWindow — that is when rendering, and therefore the panel's
+-- one-time init, begins.
+local HKPOS = { x = nil, y = nil, saveAt = nil, Path = CONFIG_DIR .. "/keybindpos.txt" }
+do
+    if type(readfile) == "function" and type(isfile) == "function" then
+        local exists = false
+        pcall(function() exists = isfile(HKPOS.Path) end)
+        if exists then
+            local ok, raw = pcall(readfile, HKPOS.Path)
+            if ok and type(raw) == "string" then
+                local x, y = raw:match("x%s*=%s*(-?%d+).-y%s*=%s*(-?%d+)")
+                HKPOS.x, HKPOS.y = tonumber(x), tonumber(y)
+            end
+        end
+    end
+    _G.RQHkLoad = function()
+        if HKPOS.x and HKPOS.y then return { x = HKPOS.x, y = HKPOS.y } end
+        return nil                       -- nil => the library keeps its own default
+    end
+end
 
 local window = Lib:CreateWindow({
     title    = "Verfall",
@@ -3529,7 +3778,7 @@ do
             -- Outstanding work has to keep moving even with BOTH toggles off, or anything the
             -- "Queue All Corpses" button queues sits in the outbox forever — its only consumer
             -- (work) used to live inside the `active` gate, so the button appeared to do nothing.
-            local busy = (#CORPSE.outbox > 0) or (#CORPSE.pending > 0)
+            local busy = (#CORPSE.outbox > 0) or (#CORPSE.pending > 0) or CRATE.ESP
             pcall(function()
                 local nowc = os.clock()
                 -- Debounced webhook save, OUTSIDE the active gate so it lands whether or not the
@@ -3555,6 +3804,42 @@ do
                     SKULL.saveAt = nil
                     SKULL.save()
                 end
+                if CRATE.saveAt and nowc >= CRATE.saveAt then
+                    CRATE.saveAt = nil
+                    CRATE.save()
+                end
+                -- Watch the keybind panel's live position (a table the library publishes by
+                -- reference) and persist it a moment after it stops moving. Comparing to the last
+                -- written value means a panel that never moves costs one table read per tick and
+                -- no disk writes at all.
+                local hp = _G.RQHkPos
+                if type(hp) == "table" and tonumber(hp.x) and tonumber(hp.y) then
+                    local nx, ny = math.floor(hp.x + 0.5), math.floor(hp.y + 0.5)
+                    if nx ~= HKPOS.x or ny ~= HKPOS.y then
+                        HKPOS.x, HKPOS.y = nx, ny
+                        HKPOS.saveAt = nowc + 0.8      -- debounce: one write when the drag settles
+                    end
+                end
+                if HKPOS.saveAt and nowc >= HKPOS.saveAt then
+                    HKPOS.saveAt = nil
+                    if type(writefile) == "function" and HKPOS.x and HKPOS.y then
+                        pcall(function()
+                            if type(makefolder) == "function" and type(isfolder) == "function"
+                               and not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
+                        end)
+                        pcall(writefile, HKPOS.Path, "x=" .. HKPOS.x .. "\ny=" .. HKPOS.y)
+                    end
+                end
+                -- Crate ESP rides this loop rather than owning one: scan is 1Hz discovery,
+                -- refresh is a 5-per-tick round-robin, draw is pure. Costs nothing while off.
+                if CRATE.ESP then
+                    if nowc >= (CRATE.nextScan or 0) then CRATE.nextScan = nowc + 1; CRATE.scan() end
+                    CRATE.refresh()
+                    CRATE.draw()
+                elseif CRATE.wasOn then
+                    CRATE.hideAll()
+                end
+                CRATE.wasOn = CRATE.ESP
                 if active then
                     if nowc >= nextScan   then nextScan   = nowc + 2;   CORPSE.scan() end
                     if nowc >= nextSample then nextSample = nowc + 0.2; CORPSE.sample() end
@@ -3902,6 +4187,45 @@ end):Tooltip("fonts this executor build actually exposes")
 -- is exactly the bug above, and it was invisible without this.
 secVelo:Label(function()
     return "font: " .. tostring(VELO.fontName) .. "   size: " .. tostring(VELO.size)
+end)
+
+-- CRATE ESP. Reads Item/Amount off ItemBags.<ToolGiver>.Crate — the PART, not the model.
+local secCrate = tabMisc:Section("Crate ESP", "Left", "What Is In Each Crate")
+secCrate:Toggle("Crate ESP", CRATE.ESP, function(v)
+    CRATE.ESP = v
+    if not v then pcall(CRATE.hideAll) end
+end):Tooltip("draw 'Wood : 11' over every item crate in the world")
+secCrate:Slider("Text Size", CRATE.size, 1, 8, 40, "", function(v)
+    CRATE.size = math.max(8, math.min(tonumber(v) or CRATE.size, 40))
+    CRATE.saveAt = os.clock() + 0.6
+end)
+secCrate:Slider("Distance", CRATE.MaxDist, 50, 50, 10000, "", function(v)
+    CRATE.MaxDist = math.max(50, math.min(tonumber(v) or CRATE.MaxDist, 100000))
+    CRATE.saveAt = os.clock() + 0.6
+end):Tooltip("how far away a crate can be and still be labelled")
+secCrate:Dropdown("Font", CRATE.fontName, VELO_FONTS, false, function(v)
+    -- Single-select dropdowns hand back a TABLE (the library wraps every value via a2()).
+    local pick = v
+    if type(pick) == "table" then pick = pick[1] end
+    pick = tostring(pick or "")
+    for _, n in ipairs(VELO_FONTS) do
+        if n == pick then
+            CRATE.fontName = pick
+            CRATE.saveAt = os.clock() + 0.6
+            for _, e in pairs(CRATE.entries) do e.dirty = true end
+            return
+        end
+    end
+end)
+secCrate:Colorpicker("Text Color", Color3.fromRGB(CRATE.r, CRATE.g, CRATE.b), function(c)
+    CRATE.r = math.floor(c.R * 255 + 0.5)
+    CRATE.g = math.floor(c.G * 255 + 0.5)
+    CRATE.b = math.floor(c.B * 255 + 0.5)
+    CRATE.colDirty = true
+    CRATE.saveAt = os.clock() + 0.6
+end)
+secCrate:Label(function()
+    return "tracked: " .. (CRATE.tracked or 0) .. " crates"
 end)
 
 local secSkull = tabMisc:Section("In Combat", "Right", "Skull While Fighting")
